@@ -32,6 +32,7 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 func (c *Coordinator) GetTask(args *Args, reply *Reply) error {
+	// Need to cleanup exisiting mess on the filesystem?
 	reply.Filename = "test"
 	reply.NReduce = c.nReduce
 	reply.ShouldStop = false
@@ -51,6 +52,11 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 		c.mapTasks[filenameDone] = true
 		c.mapTaskDone++
 	}
+
+	return nil
+}
+
+func (c *Coordinator) TaskError(args *Args, reply *Reply) error {
 
 	return nil
 }

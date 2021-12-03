@@ -18,7 +18,8 @@ var (
 )
 
 const (
-	FILENAME_FORMAT = "mr-%d-%d"
+	FILENAME_FORMAT     = "mr-%d-%d"
+	TMP_FILENAME_FORMAT = "mr-%d-%d-tmp"
 )
 
 // for sorting by key.
@@ -78,34 +79,49 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			filename := task.Filename
 			file, err := os.Open(filename)
 			if err != nil {
+				notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
 				log.Fatalf("cannot open %v", filename)
 			}
 			content, err := ioutil.ReadAll(file)
 			if err != nil {
+				notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
 				log.Fatalf("cannot read %v", filename)
 			}
 			file.Close()
 			kva := mapf(filename, string(content))
 			sort.Sort(ByKey(kva))
 
-			outFilenames, encoders := getOutputEncoders(mapTaskNum, nReduce)
+			// Should we write to a tmp file and then rename it?
+			finalFilenames, tmpFilenames, outFiles, encoders := getOutputEncoders(mapTaskNum, nReduce)
 			for _, kv := range kva {
 				keyHash := ihash(kv.Key)
 				N := keyHash % nReduce
 				err := encoders[N].Encode(&kv)
 				if err != nil {
+					notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
 					log.Fatalf("Problem encode %v to file: %v\n", kv, filename)
 				}
 			}
 			// Finished writing to file, close all files
-			for _, outf := range outFilenames {
-				outf.Close()
+			for _, outFile := range outFiles {
+				outFile.Close()
+			}
+
+			if len(tmpFilenames) != len(finalFilenames) { // should never happen
+				notifyCoordinatorOnError(task.JobName, filename, "[ERROR]: tmpFilenames and finalFilenames are not the same length", mapTaskNum)
+				log.Println("[ERROR]: tmpFilenames and finalFilenames are not the same length")
+			}
+			// Now rename the tmp files to the final files
+			for i, tmpFilename := range tmpFilenames {
+				err := os.Rename(tmpFilename, finalFilenames[i])
+				if err != nil {
+					notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
+					log.Fatalf("Problem renaming %v to %v\n", tmpFilename, finalFilenames[i])
+				}
 			}
 
 			// Notify coordinator that map task is done
-
 			args := Args{JobName: "map", TaskNum: mapTaskNum, Filename: filename, Status: MapTaskDone}
-
 			notifyCoordinator(args)
 
 		} else if task.JobName == "reduce" {
@@ -119,21 +135,27 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 }
 
-// TODO:
-func getOutputEncoders(mapTaskNum, nReduce int) ([]*os.File, []*json.Encoder) {
+// I know, not ideal, but it works
+func getOutputEncoders(mapTaskNum, nReduce int) ([]string, []string, []*os.File, []*json.Encoder) {
 	files := make([]*os.File, nReduce)
+	tmpFilenames := make([]string, nReduce)
+	finalFilenames := make([]string, nReduce)
 	encoders := make([]*json.Encoder, nReduce)
 	for i := 0; i < nReduce; i++ {
-		filename := fmt.Sprintf(FILENAME_FORMAT, mapTaskNum, i)
-		file, err := os.Create(filename)
+		tmpFilename := fmt.Sprintf(TMP_FILENAME_FORMAT, mapTaskNum, i)
+		tmpFilenames[i] = tmpFilename
 
+		finalFilename := fmt.Sprintf(FILENAME_FORMAT, mapTaskNum, i)
+		finalFilenames[i] = finalFilename
+
+		file, err := os.Create(tmpFilename)
 		if err != nil {
-			log.Fatalf("cannot open %v\n", filename)
+			log.Fatalf("cannot open %v\n", tmpFilename)
 		}
 		files[i] = file
 		encoders[i] = json.NewEncoder(file)
 	}
-	return files, encoders
+	return finalFilenames, tmpFilenames, files, encoders
 }
 
 // Get one task from the coordinator
@@ -147,6 +169,36 @@ func getTask() Reply {
 func notifyCoordinator(args Args) {
 	reply := Reply{}
 	call("Coordinator.TaskDone", &args, &reply)
+}
+
+func notifyCoordinatorOnError(jobName, filename, errMessage string, taskNum int) {
+	reply := Reply{}
+	args := Args{
+		JobName:  jobName,
+		Filename: filename,
+		Status:   TaskError,
+		Message:  errMessage,
+		TaskNum:  taskNum,
+	}
+	call("Coordinator.TaskError", &args, &reply)
+}
+
+func call(rpcname string, args *Args, reply *Reply) bool {
+	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	sockname := coordinatorSock()
+	c, err := rpc.DialHTTP("unix", sockname)
+	if err != nil {
+		log.Fatal("dialing:", err)
+	}
+	defer c.Close()
+
+	err = c.Call(rpcname, args, reply)
+	if err == nil {
+		return true
+	}
+
+	log.Println("[RPC]: ", err)
+	return false
 }
 
 //
@@ -172,20 +224,3 @@ func notifyCoordinator(args Args) {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args *Args, reply *Reply) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
-	if err != nil {
-		log.Fatal("dialing:", err)
-	}
-	defer c.Close()
-
-	err = c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	log.Println("[RPC]: ", err)
-	return false
-}

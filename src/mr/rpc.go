@@ -37,16 +37,17 @@ func coordinatorSock() string {
 }
 
 const (
-	MapTaskDone    = 0
-	ReduceTaskDone = 1
-	Error          = 2
+	MapTaskDone    int = 0
+	ReduceTaskDone int = 1
+	TaskError      int = 2
 )
 
 type Args struct {
-	JobName  string
-	Filename string
+	JobName  string // "map" or "reduce"
+	Filename string // for Map
 	TaskNum  int
 	Status   int
+	Message  string
 }
 
 type Reply struct {
