@@ -56,9 +56,10 @@ type Args struct {
 }
 
 type Reply struct {
-	TaskName   string
-	Filename   string
-	NReduce    int
-	TaskNum    int
-	ShouldStop bool
+	TaskName     string
+	Filename     string
+	NReduce      int
+	TaskNum      int
+	ShouldStop   bool
+	MapTaskCount int
 }

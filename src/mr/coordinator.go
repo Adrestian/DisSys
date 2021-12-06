@@ -8,12 +8,14 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 const (
-	IDLE        string = "idle"
-	IN_PROGRESS string = "in_progress"
-	DONE        string = "done"
+	IDLE        string        = "idle"
+	IN_PROGRESS string        = "in_progress"
+	DONE        string        = "done"
+	TIMEOUT     time.Duration = time.Second * 10
 )
 
 type Coordinator struct {
@@ -29,7 +31,9 @@ type Coordinator struct {
 
 	reduceTaskCount int            // equal to the number of reduce tasks, which is nReduce
 	reduceTasks     map[int]string // track the progress of reduce tasks
-	reduceTaskDone  bool
+	//reduceTaskToNumber map[int]int    // track the number of reduce tasks for each input file, map filename to task number
+	reduceTaskDone          bool
+	finishedReduceTaskCount int
 
 	allTaskDone bool
 }
@@ -56,26 +60,60 @@ func (c *Coordinator) GetTask(args *Args, reply *Reply) error {
 				reply.ShouldStop = false
 
 				c.mapTasks[filename] = IN_PROGRESS // update the task status
+
+				go func(mapTaskFilename string) {
+					<-time.After(TIMEOUT)
+					c.mu.Lock()
+					defer c.mu.Unlock()
+					if c.mapTasks[mapTaskFilename] == IN_PROGRESS {
+						c.mapTasks[mapTaskFilename] = IDLE
+					}
+				}(filename)
+
 				return nil
 			}
 		}
 	} else if !c.reduceTaskDone { // there are still reduce tasks to do
-		// TODO:
+		for taskNumber, status := range c.reduceTasks {
+			if status == IDLE { // give worker a task
+				reply.TaskName = REDUCE_TASK
+				reply.NReduce = c.nReduce
+				reply.TaskNum = taskNumber
+				reply.ShouldStop = false
+				reply.MapTaskCount = c.mapTaskCount
+
+				c.reduceTasks[taskNumber] = IN_PROGRESS // update the task status
+
+				// If worker doesn't reply in 10 seconds, assume worker's crashed an reschedule the reduce task
+				go func(reduceTaskNumber int) {
+					<-time.After(TIMEOUT)
+					c.mu.Lock()
+					defer c.mu.Unlock()
+					if c.reduceTasks[reduceTaskNumber] == IN_PROGRESS {
+						c.reduceTasks[reduceTaskNumber] = IDLE
+					}
+				}(taskNumber)
+
+				return nil
+			}
+		}
 	}
 
 	return nil
 }
 
 func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
-	log.Println(args)
+	log.Println("[Task Done]: ", args)
 
 	taskName := args.TaskName
 	taskNumber := args.TaskNum
 	filenameDone := args.Filename
 	taskStatus := args.Status
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if taskStatus == MapTaskDone {
-		c.mu.Lock()
-		defer c.mu.Unlock()
 		if _, ok := c.mapTasks[filenameDone]; ok {
 			c.mapTasks[filenameDone] = DONE
 			c.finishedMapTaskCount++
@@ -87,10 +125,20 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 		}
 
 	} else if taskStatus == ReduceTaskDone {
-		// TODO:
+		if _, ok := c.reduceTasks[taskNumber]; ok {
+			c.reduceTasks[taskNumber] = DONE
+			c.finishedReduceTaskCount++
+			if c.finishedReduceTaskCount == c.nReduce {
+				c.reduceTaskDone = true
+			}
+		} else {
+			log.Printf("[TaskDone]: Worker Reply With A Non-Existent Filename. Task: %v, Filename: %v, Task#: %v, Status: %v \n", taskName, filenameDone, taskNumber, taskStatus)
+		}
 	} else {
 		log.Printf("[TaskDone]: Unknown Task Status: %v\n", taskStatus)
 	}
+
+	reply.ShouldStop = false
 
 	if c.mapTasksDone && c.reduceTaskDone { // if all the tasks are done, tell workers to exit
 		c.allTaskDone = true
@@ -101,28 +149,32 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 }
 
 func (c *Coordinator) TaskError(args *Args, reply *Reply) error {
-	errJobName := args.TaskName
+	errTaskName := args.TaskName
 	errFilename := args.Filename
 	errTaskNum := args.TaskNum
 	errMessage := args.Message
 	log.Printf("[Worker Error] Task: %v, Filename: %v, Task#: %v, Error Message: %v \n",
-		errJobName, errFilename, errTaskNum, errMessage)
+		errTaskName, errFilename, errTaskNum, errMessage)
 
 	// IMPORTANT
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if errJobName == MAP_TASK {
+	if errTaskName == MAP_TASK {
 		// First make sure the error filename is actually in the map, otherwise there's something wring
 		if _, ok := c.mapTasks[errFilename]; ok {
 			c.mapTasks[errFilename] = IDLE // reset the task status
 		} else {
-			log.Printf("[Worker Error]: Worker Reply With A Non-Existent Filename. Task: %v, Filename: %v, Task#: %v, Error Message: %v \n", errJobName, errFilename, errTaskNum, errMessage)
+			log.Printf("[Worker Error]: Worker Reply With A Non-Existent Filename. Task: %v, Filename: %v, Task#: %v, Error Message: %v \n", errTaskName, errFilename, errTaskNum, errMessage)
 		}
-	} else if errJobName == REDUCE_TASK {
-		// TODO:
+	} else if errTaskName == REDUCE_TASK {
+		if _, ok := c.reduceTasks[errTaskNum]; ok {
+			c.reduceTasks[errTaskNum] = IDLE // reset the task status
+		} else {
+			log.Printf("[Worker Error]: Worker Reply With A Non-Existent Filename. Task: %v, Filename: %v, Task#: %v, Error Message: %v \n", errTaskName, errFilename, errTaskNum, errMessage)
+		}
 	} else {
-		log.Printf("[Worker Fatal Error]: Unknown Task Name: %v\n", errJobName)
+		log.Printf("[Worker Fatal Error]: Unknown Task Name: %v\n", errTaskName)
 	}
 	return nil
 }
@@ -173,15 +225,20 @@ func MakeCoordinator(filenames []string, nReduce int) *Coordinator {
 
 func initCoordinator(filenames []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		filenames:       filenames,
-		nReduce:         nReduce,
-		mapTaskCount:    len(filenames),
-		reduceTaskCount: nReduce,
-		mapTasks:        make(map[string]string),
-		mapTaskToNumber: make(map[string]int),
-		mapTasksDone:    false,
-		reduceTaskDone:  false,
-		allTaskDone:     false,
+		filenames: filenames,
+		nReduce:   nReduce,
+
+		mapTaskCount:         len(filenames),
+		mapTasks:             make(map[string]string),
+		mapTaskToNumber:      make(map[string]int),
+		mapTasksDone:         false,
+		finishedMapTaskCount: 0,
+
+		reduceTasks:             make(map[int]string),
+		reduceTaskCount:         nReduce,
+		reduceTaskDone:          false,
+		allTaskDone:             false,
+		finishedReduceTaskCount: 0,
 	}
 
 	// initialize mapTasks

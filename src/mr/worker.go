@@ -92,8 +92,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			kva := mapf(filename, string(content))
 			sort.Sort(ByKey(kva))
 
-			// Should we write to a tmp file and then rename it?
-			finalFilenames := getFinalFilenames(taskNumber, nReduce)
+			// Write to a tmp file and then rename it
+			intermediateFilenames := getIntermediateFilenames(taskNumber, nReduce)
+			log.Println("finalFilenames: ", intermediateFilenames)
+
 			tmpFiles, err := getTmpFiles(nReduce)
 			if err != nil {
 				notifyCoordinatorOnError(task.TaskName, filename, err.Error(), taskNumber)
@@ -111,11 +113,11 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			closeAllFiles(tmpFiles)
 
 			// Atomically rename all files, don't care about errors
-			renameFiles(finalFilenames, tmpFiles)
+			renameFiles(intermediateFilenames, tmpFiles)
 
 			// Finally Notify coordinator that map task is done
 			args := Args{
-				TaskName: "map",
+				TaskName: MAP_TASK,
 				TaskNum:  taskNumber,
 				Filename: filename,
 				Status:   MapTaskDone,
@@ -124,17 +126,61 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			reply := notifyCoordinatorOnSuccess(args)
 			if reply.ShouldStop {
 				shouldStop = true
+				os.Exit(0)
 			}
-
 		} else if task.TaskName == REDUCE_TASK { // Should do "reduce"
-			// TODO:
+			taskNumber := task.TaskNum
+			totalMapTaskCount := task.MapTaskCount
+			inputFiles := getInputFiles(taskNumber, totalMapTaskCount)
+			defer closeAllFiles(inputFiles)
 
+			outFilename := getOutputFilename(taskNumber) // final output file name
+			tmpFile, err := ioutil.TempFile("", "tmpReduce*")
+			if err != nil { // worker encountered error
+				notifyCoordinatorOnError(task.TaskName, outFilename, err.Error(), taskNumber)
+				checkError(err, "Cannot create tmp file")
+			}
+			// TODO: Read everything from input files, decode them, write it out to tmpFile
+
+			os.Rename(tmpFile.Name(), outFilename) // atomically rename tmpFile to outFilename
+			// Notify the coordinator
+			args := Args{
+				TaskName: REDUCE_TASK,
+				TaskNum:  taskNumber,
+				Filename: outFilename,
+				Status:   ReduceTaskDone,
+				Message:  "Reduce Task Done",
+			}
+			// Can share reply and handling stopping for both if branches, but no time to refactor
+			reply := notifyCoordinatorOnSuccess(args)
+			if reply.ShouldStop {
+				shouldStop = true
+				os.Exit(0)
+			}
 		} else {
 			log.Fatalf("Unknown job name: %v\n", task.TaskName)
 		}
 		time.Sleep(time.Second)
 	}
 
+}
+
+func getOutputFilename(taskNumber int) string {
+	return fmt.Sprintf(OUTPUT_FILE_FORMAT, taskNumber)
+}
+
+func getInputFiles(taskNumber int, mapTaskCount int) []*os.File {
+	inputFiles := make([]*os.File, nReduce)
+	for i := 0; i < mapTaskCount; i++ {
+		filename := fmt.Sprintf(FILENAME_FORMAT, i, taskNumber)
+		file, err := os.Open(filename)
+		if err != nil {
+			notifyCoordinatorOnError(REDUCE_TASK, filename, err.Error(), taskNumber)
+			checkError(err, "Cannot open all the files required for reduce")
+		}
+		inputFiles[i] = file
+	}
+	return inputFiles
 }
 
 func closeAllFiles(files []*os.File) {
@@ -150,7 +196,7 @@ func encodeAll(kva []KeyValue, encoders []*json.Encoder) error {
 	for _, kv := range kva {
 		keyHash := ihash(kv.Key)
 		N := keyHash % nReduce
-		err := encoders[N].Encode(&kv)
+		err := encoders[N].Encode(kv)
 		if err != nil {
 			return err
 		}
@@ -160,19 +206,20 @@ func encodeAll(kva []KeyValue, encoders []*json.Encoder) error {
 
 // return true if the worker should exit
 func checkTask(task *Reply) bool {
+	if task.ShouldStop {
+		shouldStop = true
+		return true
+	}
 	// Something is up if nReduce changes
 	if nReduce != 0 && task.NReduce != nReduce { // nReduce is a global variable
 		log.Printf("nReduce changed from %v to %v \n", nReduce, task.NReduce)
 	}
 	nReduce = task.NReduce
 
-	if task.ShouldStop {
-		return true
-	}
 	return false
 }
 
-func getFinalFilenames(taskNumber int, nReduce int) []string {
+func getIntermediateFilenames(taskNumber int, nReduce int) []string {
 	finalFilenames := make([]string, nReduce)
 	for i := 0; i < nReduce; i++ {
 		finalFilenames[i] = fmt.Sprintf(FILENAME_FORMAT, taskNumber, i)
