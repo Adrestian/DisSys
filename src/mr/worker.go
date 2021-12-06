@@ -195,8 +195,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			}
 		} else {
 			log.Printf("Unknown job name: %v\n", task)
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(time.Second)
+
 	}
 
 }
