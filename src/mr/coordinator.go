@@ -84,7 +84,7 @@ func (c *Coordinator) GetTask(args *Args, reply *Reply) error {
 
 				c.reduceTasks[taskNumber] = IN_PROGRESS // update the task status
 
-				// If worker doesn't reply in 10 seconds, assume worker's crashed an reschedule the reduce task
+				// If worker doesn't reply in 10 seconds, assume worker's crashed anD reschedule the reduce task
 				go func(reduceTaskNumber int) {
 					<-time.After(TIMEOUT)
 					c.mu.Lock()

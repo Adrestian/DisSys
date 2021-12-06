@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	nReduce    int
+	nReduce    int = 0 // nReduce is only set once, we igonore subsequent nReduce field from the reply
 	shouldStop bool
 )
 
@@ -132,7 +132,6 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			totalMapTaskCount := task.MapTaskCount
 
 			inputFiles := getInputFiles(taskNumber, totalMapTaskCount)
-			defer closeAllFiles(inputFiles)
 
 			outFilename := getFinalOutputFilename(taskNumber) // final output file name
 			tmpFile, err := ioutil.TempFile("", "tmpReduce*")
@@ -154,6 +153,9 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 					mem = append(mem, kv)
 				}
 			}
+
+			closeAllFiles(inputFiles)
+
 			sort.Sort(ByKey(mem)) // sort by key
 
 			// apply user's reduce function, stolen from mrsequential.go
@@ -186,13 +188,13 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				Message:  "Reduce Task Done",
 			}
 			// Can share reply and handling stopping for both if branches, but no time to refactor
-			reply := notifyCoordinatorOnSuccess(args)
-			if reply.ShouldStop {
+
+			if reply := notifyCoordinatorOnSuccess(args); reply.ShouldStop {
 				shouldStop = true
 				os.Exit(0)
 			}
 		} else {
-			log.Fatalf("Unknown job name: %v\n", task.TaskName)
+			log.Printf("Unknown job name: %v\n", task)
 		}
 		time.Sleep(time.Second)
 	}
@@ -257,11 +259,9 @@ func checkTask(task *Reply) bool {
 		return true
 	}
 	// Something is up if nReduce changes
-	if nReduce != 0 && task.NReduce != nReduce { // nReduce is a global variable
-		log.Printf("nReduce changed from %v to %v \n", nReduce, task.NReduce)
+	if nReduce == 0 { // {@code nReduce} is a global variable, initialize to 0
+		nReduce = task.NReduce // nReduce is only set once
 	}
-	nReduce = task.NReduce
-
 	return false
 }
 
