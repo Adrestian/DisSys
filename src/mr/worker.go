@@ -93,7 +93,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			sort.Sort(ByKey(kva))
 
 			// Write to a tmp file and then rename it
-			intermediateFilenames := getIntermediateFilenames(taskNumber, nReduce)
+			intermediateFilenames := getMapIntermediateFilenames(taskNumber, nReduce)
 			log.Println("finalFilenames: ", intermediateFilenames)
 
 			tmpFiles, err := getTmpFiles(nReduce)
@@ -102,7 +102,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				checkError(err, "Cannot get tmp files for map")
 			}
 
-			encoders := getOutputEncoders(tmpFiles)
+			encoders := getEncoders(tmpFiles)
 
 			err = encodeAll(kva, encoders)
 			if err != nil {
@@ -131,16 +131,51 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 		} else if task.TaskName == REDUCE_TASK { // Should do "reduce"
 			taskNumber := task.TaskNum
 			totalMapTaskCount := task.MapTaskCount
+
 			inputFiles := getInputFiles(taskNumber, totalMapTaskCount)
 			defer closeAllFiles(inputFiles)
 
 			outFilename := getOutputFilename(taskNumber) // final output file name
 			tmpFile, err := ioutil.TempFile("", "tmpReduce*")
-			if err != nil { // worker encountered error
+			if err != nil { // worker encountered error when creating tmp file
 				notifyCoordinatorOnError(task.TaskName, outFilename, err.Error(), taskNumber)
 				checkError(err, "Cannot create tmp file")
 			}
-			// TODO: Read everything from input files, decode them, write it out to tmpFile
+
+			decoders := getDecoders(inputFiles)
+			mem := []KeyValue{} // in memory buffer to reduce
+			// Read everything from input files
+			for _, decoder := range decoders {
+				for {
+					var kv KeyValue
+					// decode them into memory, if there is no more data, break
+					if err := decoder.Decode(&kv); err != nil {
+						break
+					}
+					mem = append(mem, kv)
+				}
+			}
+			sort.Sort(ByKey(mem)) // sort by key
+
+			// apply user's reduce function, stolen from mrsequential.go
+			i := 0
+			for i < len(mem) {
+				j := i + 1
+				for j < len(mem) && mem[j].Key == mem[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, mem[k].Value)
+				}
+				output := reducef(mem[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(tmpFile, "%v %v\n", mem[i].Key, output)
+				i = j
+			}
+
+			tmpFile.Close() // write it out to tmpFile
 
 			os.Rename(tmpFile.Name(), outFilename) // atomically rename tmpFile to outFilename
 			// Notify the coordinator
@@ -219,12 +254,22 @@ func checkTask(task *Reply) bool {
 	return false
 }
 
-func getIntermediateFilenames(taskNumber int, nReduce int) []string {
+func getMapIntermediateFilenames(taskNumber int, nReduce int) []string {
 	finalFilenames := make([]string, nReduce)
 	for i := 0; i < nReduce; i++ {
 		finalFilenames[i] = fmt.Sprintf(FILENAME_FORMAT, taskNumber, i)
 	}
 	return finalFilenames
+}
+
+func getReduceIntermediateFilenames(taskNumber int, mapTaskCount int) []string {
+	filenames := make([]string, nReduce)
+	for i := 0; i < mapTaskCount; i++ {
+		filename := fmt.Sprintf(FILENAME_FORMAT, i, taskNumber)
+		filenames[i] = filename
+	}
+
+	return filenames
 }
 
 func getTmpFiles(nReduce int) ([]*os.File, error) {
@@ -239,8 +284,7 @@ func getTmpFiles(nReduce int) ([]*os.File, error) {
 	return tmpFiles, nil
 }
 
-// I know, not ideal, but it works
-func getOutputEncoders(files []*os.File) []*json.Encoder {
+func getEncoders(files []*os.File) []*json.Encoder {
 	nFiles := len(files)
 	encoders := make([]*json.Encoder, nFiles)
 
@@ -248,6 +292,16 @@ func getOutputEncoders(files []*os.File) []*json.Encoder {
 		encoders[i] = json.NewEncoder(files[i])
 	}
 	return encoders
+}
+
+func getDecoders(files []*os.File) []*json.Decoder {
+	nFiles := len(files)
+	decoders := make([]*json.Decoder, nFiles)
+
+	for i := 0; i < nFiles; i++ {
+		decoders[i] = json.NewDecoder(files[i])
+	}
+	return decoders
 }
 
 // Get one task from the coordinator
