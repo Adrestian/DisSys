@@ -59,8 +59,6 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	// Then modify the coordinator to respond with the file name of an as-yet-unstarted map task.
 	// Then modify the worker to read that file and call the application Map function, as in mrsequential.go.
 
-	// CallExample()
-
 	for !shouldStop {
 		// Get a task from coordinator
 		task, ok := getTask() // task: Reply, the reply from the coordinator
@@ -68,8 +66,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			os.Exit(0)
 		}
 
-		shouldExit := checkTask(&task)
-		if shouldExit { // Coordinator told worker to exit
+		if checkTask(&task) { // Coordinator told worker to exit
 			os.Exit(0)
 		}
 
@@ -113,7 +110,10 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			closeAllFiles(tmpFiles)
 
 			// Atomically rename all files, don't care about errors
-			renameFiles(intermediateFilenames, tmpFiles)
+			ok = renameFiles(intermediateFilenames, tmpFiles)
+			if !ok {
+				notifyCoordinatorOnError(task.TaskName, filename, "Cannot rename files", taskNumber)
+			}
 
 			// Finally Notify coordinator that map task is done
 			args := Args{
@@ -124,8 +124,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 				Message:  "Map Task Done",
 			}
 			reply := notifyCoordinatorOnSuccess(args)
-			if reply.ShouldStop {
-				shouldStop = true
+			if checkTask(&reply) {
 				os.Exit(0)
 			}
 		} else if task.TaskName == REDUCE_TASK { // Should do "reduce"
@@ -135,7 +134,7 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 			inputFiles := getInputFiles(taskNumber, totalMapTaskCount)
 			defer closeAllFiles(inputFiles)
 
-			outFilename := getOutputFilename(taskNumber) // final output file name
+			outFilename := getFinalOutputFilename(taskNumber) // final output file name
 			tmpFile, err := ioutil.TempFile("", "tmpReduce*")
 			if err != nil { // worker encountered error when creating tmp file
 				notifyCoordinatorOnError(task.TaskName, outFilename, err.Error(), taskNumber)
@@ -200,14 +199,26 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 }
 
-func getOutputFilename(taskNumber int) string {
+func getFinalOutputFilename(taskNumber int) string {
 	return fmt.Sprintf(OUTPUT_FILE_FORMAT, taskNumber)
 }
 
-func getInputFiles(taskNumber int, mapTaskCount int) []*os.File {
-	inputFiles := make([]*os.File, nReduce)
+func getReduceInputFilenames(taskNumber, mapTaskCount int) []string {
+	filenames := make([]string, mapTaskCount)
+
 	for i := 0; i < mapTaskCount; i++ {
-		filename := fmt.Sprintf(FILENAME_FORMAT, i, taskNumber)
+		filenames[i] = fmt.Sprintf(FILENAME_FORMAT, i, taskNumber)
+	}
+	return filenames
+}
+
+func getInputFiles(taskNumber int, mapTaskCount int) []*os.File {
+	inputFiles := make([]*os.File, mapTaskCount)
+	filenames := getReduceInputFilenames(taskNumber, mapTaskCount)
+	if len(filenames) != len(inputFiles) {
+		panic("The length of filenames and inputFiles should be the same")
+	}
+	for i, filename := range filenames {
 		file, err := os.Open(filename)
 		if err != nil {
 			notifyCoordinatorOnError(REDUCE_TASK, filename, err.Error(), taskNumber)
@@ -231,7 +242,7 @@ func encodeAll(kva []KeyValue, encoders []*json.Encoder) error {
 	for _, kv := range kva {
 		keyHash := ihash(kv.Key)
 		N := keyHash % nReduce
-		err := encoders[N].Encode(kv)
+		err := encoders[N].Encode(&kv)
 		if err != nil {
 			return err
 		}
@@ -275,7 +286,7 @@ func getReduceIntermediateFilenames(taskNumber int, mapTaskCount int) []string {
 func getTmpFiles(nReduce int) ([]*os.File, error) {
 	tmpFiles := make([]*os.File, nReduce)
 	for i := 0; i < nReduce; i++ {
-		tmpFile, err := ioutil.TempFile("", "tmp****")
+		tmpFile, err := ioutil.TempFile("", fmt.Sprintf("%v***", TMP_FILENAME_FORMAT))
 		if err != nil {
 			return tmpFiles, err
 		}
@@ -322,7 +333,6 @@ func renameFiles(finalFilenames []string, tmpFiles []*os.File) bool {
 		log.Println("[ERROR]: Cannot rename files, finalFilenames and tmpFiles are not the same length")
 		return false
 	}
-
 	var encounteredError bool = false
 	for i, tmpFile := range tmpFiles {
 		tmpFilename := tmpFile.Name()
@@ -337,9 +347,9 @@ func renameFiles(finalFilenames []string, tmpFiles []*os.File) bool {
 
 func checkError(err error, msg string) {
 	if err != nil {
+		shouldStop = true
 		log.Fatalf("[ERROR] %v: %v\n", msg, err.Error())
 	}
-	shouldStop = true
 	return
 }
 

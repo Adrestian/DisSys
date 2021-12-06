@@ -114,7 +114,7 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 	defer c.mu.Unlock()
 
 	if taskStatus == MapTaskDone {
-		if _, ok := c.mapTasks[filenameDone]; ok {
+		if status, ok := c.mapTasks[filenameDone]; status == IN_PROGRESS && ok {
 			c.mapTasks[filenameDone] = DONE
 			c.finishedMapTaskCount++
 			if c.finishedMapTaskCount == c.mapTaskCount {
@@ -125,7 +125,7 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 		}
 
 	} else if taskStatus == ReduceTaskDone {
-		if _, ok := c.reduceTasks[taskNumber]; ok {
+		if status, ok := c.reduceTasks[taskNumber]; status == IN_PROGRESS && ok {
 			c.reduceTasks[taskNumber] = DONE
 			c.finishedReduceTaskCount++
 			if c.finishedReduceTaskCount == c.nReduce {
@@ -136,6 +136,7 @@ func (c *Coordinator) TaskDone(args *Args, reply *Reply) error {
 		}
 	} else {
 		log.Printf("[TaskDone]: Unknown Task Status: %v\n", taskStatus)
+		log.Println(args)
 	}
 
 	reply.ShouldStop = false
