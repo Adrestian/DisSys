@@ -16,13 +16,13 @@ import (
 // and reply for an RPC.
 //
 
-type ExampleArgs struct {
-	X int
-}
+// type ExampleArgs struct {
+// 	X int
+// }
 
-type ExampleReply struct {
-	Y int
-}
+// type ExampleReply struct {
+// 	Y int
+// }
 
 // Add your RPC definitions here.
 
@@ -42,8 +42,13 @@ const (
 	TaskError      int = 2
 )
 
+const (
+	MAP_TASK    string = "map"
+	REDUCE_TASK string = "reduce"
+)
+
 type Args struct {
-	JobName  string // "map" or "reduce"
+	TaskName string // "map" or "reduce"
 	Filename string // for Map
 	TaskNum  int
 	Status   int
@@ -51,7 +56,7 @@ type Args struct {
 }
 
 type Reply struct {
-	JobName    string
+	TaskName   string
 	Filename   string
 	NReduce    int
 	TaskNum    int

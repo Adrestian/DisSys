@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io/ioutil"
@@ -18,11 +19,12 @@ var (
 )
 
 const (
-	FILENAME_FORMAT     = "mr-%d-%d"
-	TMP_FILENAME_FORMAT = "mr-%d-%d-tmp"
+	FILENAME_FORMAT     string = "mr-%d-%d"
+	TMP_FILENAME_FORMAT string = "mr-%d-%d-tmp"
+	OUTPUT_FILE_FORMAT  string = "mr-out-%d"
 )
 
-// for sorting by key.
+// for sorting by key. Stolen from mrsequential.go
 type ByKey []KeyValue
 
 // for sorting by key.
@@ -30,9 +32,7 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-//
 // Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
@@ -63,118 +63,196 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	for !shouldStop {
 		// Get a task from coordinator
-		task := getTask()
-		if nReduce != 0 && task.NReduce != nReduce {
-			log.Printf("nReduce changed from %v to %v \n", nReduce, task.NReduce)
-		}
-		nReduce = task.NReduce
-
-		mapTaskNum := task.TaskNum
-		if task.ShouldStop {
-			shouldStop = true
-			break
+		task, ok := getTask() // task: Reply, the reply from the coordinator
+		if !ok {
+			os.Exit(0)
 		}
 
-		if task.JobName == "map" {
+		shouldExit := checkTask(&task)
+		if shouldExit { // Coordinator told worker to exit
+			os.Exit(0)
+		}
+
+		if task.TaskName == MAP_TASK { // Should do "map"
+			taskNumber := task.TaskNum
 			filename := task.Filename
 			file, err := os.Open(filename)
-			if err != nil {
-				notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
-				log.Fatalf("cannot open %v", filename)
+
+			if err != nil { // worker encountered error
+				notifyCoordinatorOnError(task.TaskName, filename, err.Error(), taskNumber)
+				checkError(err, "cannot open file")
 			}
 			content, err := ioutil.ReadAll(file)
-			if err != nil {
-				notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
+			if err != nil { // worker encountered error
+				notifyCoordinatorOnError(task.TaskName, filename, err.Error(), taskNumber)
 				log.Fatalf("cannot read %v", filename)
 			}
 			file.Close()
+
 			kva := mapf(filename, string(content))
 			sort.Sort(ByKey(kva))
 
 			// Should we write to a tmp file and then rename it?
-			finalFilenames, tmpFilenames, outFiles, encoders := getOutputEncoders(mapTaskNum, nReduce)
-			for _, kv := range kva {
-				keyHash := ihash(kv.Key)
-				N := keyHash % nReduce
-				err := encoders[N].Encode(&kv)
-				if err != nil {
-					notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
-					log.Fatalf("Problem encode %v to file: %v\n", kv, filename)
-				}
+			finalFilenames := getFinalFilenames(taskNumber, nReduce)
+			tmpFiles, err := getTmpFiles(nReduce)
+			if err != nil {
+				notifyCoordinatorOnError(task.TaskName, filename, err.Error(), taskNumber)
+				checkError(err, "Cannot get tmp files for map")
+			}
+
+			encoders := getOutputEncoders(tmpFiles)
+
+			err = encodeAll(kva, encoders)
+			if err != nil {
+				notifyCoordinatorOnError(task.TaskName, filename, err.Error(), taskNumber)
+				log.Fatalf("Problem encode file: %v\n", filename)
 			}
 			// Finished writing to file, close all files
-			for _, outFile := range outFiles {
-				outFile.Close()
+			closeAllFiles(tmpFiles)
+
+			// Atomically rename all files, don't care about errors
+			renameFiles(finalFilenames, tmpFiles)
+
+			// Finally Notify coordinator that map task is done
+			args := Args{
+				TaskName: "map",
+				TaskNum:  taskNumber,
+				Filename: filename,
+				Status:   MapTaskDone,
+				Message:  "Map Task Done",
+			}
+			reply := notifyCoordinatorOnSuccess(args)
+			if reply.ShouldStop {
+				shouldStop = true
 			}
 
-			if len(tmpFilenames) != len(finalFilenames) { // should never happen
-				notifyCoordinatorOnError(task.JobName, filename, "[ERROR]: tmpFilenames and finalFilenames are not the same length", mapTaskNum)
-				log.Println("[ERROR]: tmpFilenames and finalFilenames are not the same length")
-			}
-			// Now rename the tmp files to the final files
-			for i, tmpFilename := range tmpFilenames {
-				err := os.Rename(tmpFilename, finalFilenames[i])
-				if err != nil {
-					notifyCoordinatorOnError(task.JobName, filename, err.Error(), mapTaskNum)
-					log.Fatalf("Problem renaming %v to %v\n", tmpFilename, finalFilenames[i])
-				}
-			}
-
-			// Notify coordinator that map task is done
-			args := Args{JobName: "map", TaskNum: mapTaskNum, Filename: filename, Status: MapTaskDone}
-			notifyCoordinator(args)
-
-		} else if task.JobName == "reduce" {
+		} else if task.TaskName == REDUCE_TASK { // Should do "reduce"
 			// TODO:
 
 		} else {
-			fmt.Println("Unknown job name")
+			log.Fatalf("Unknown job name: %v\n", task.TaskName)
 		}
 		time.Sleep(time.Second)
 	}
 
 }
 
-// I know, not ideal, but it works
-func getOutputEncoders(mapTaskNum, nReduce int) ([]string, []string, []*os.File, []*json.Encoder) {
-	files := make([]*os.File, nReduce)
-	tmpFilenames := make([]string, nReduce)
-	finalFilenames := make([]string, nReduce)
-	encoders := make([]*json.Encoder, nReduce)
-	for i := 0; i < nReduce; i++ {
-		tmpFilename := fmt.Sprintf(TMP_FILENAME_FORMAT, mapTaskNum, i)
-		tmpFilenames[i] = tmpFilename
-
-		finalFilename := fmt.Sprintf(FILENAME_FORMAT, mapTaskNum, i)
-		finalFilenames[i] = finalFilename
-
-		file, err := os.Create(tmpFilename)
-		if err != nil {
-			log.Fatalf("cannot open %v\n", tmpFilename)
-		}
-		files[i] = file
-		encoders[i] = json.NewEncoder(file)
+func closeAllFiles(files []*os.File) {
+	for _, file := range files {
+		file.Close()
 	}
-	return finalFilenames, tmpFilenames, files, encoders
+}
+
+func encodeAll(kva []KeyValue, encoders []*json.Encoder) error {
+	if len(encoders) == 0 {
+		return errors.New("No encoders")
+	}
+	for _, kv := range kva {
+		keyHash := ihash(kv.Key)
+		N := keyHash % nReduce
+		err := encoders[N].Encode(&kv)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// return true if the worker should exit
+func checkTask(task *Reply) bool {
+	// Something is up if nReduce changes
+	if nReduce != 0 && task.NReduce != nReduce { // nReduce is a global variable
+		log.Printf("nReduce changed from %v to %v \n", nReduce, task.NReduce)
+	}
+	nReduce = task.NReduce
+
+	if task.ShouldStop {
+		return true
+	}
+	return false
+}
+
+func getFinalFilenames(taskNumber int, nReduce int) []string {
+	finalFilenames := make([]string, nReduce)
+	for i := 0; i < nReduce; i++ {
+		finalFilenames[i] = fmt.Sprintf(FILENAME_FORMAT, taskNumber, i)
+	}
+	return finalFilenames
+}
+
+func getTmpFiles(nReduce int) ([]*os.File, error) {
+	tmpFiles := make([]*os.File, nReduce)
+	for i := 0; i < nReduce; i++ {
+		tmpFile, err := ioutil.TempFile("", "tmp****")
+		if err != nil {
+			return tmpFiles, err
+		}
+		tmpFiles[i] = tmpFile
+	}
+	return tmpFiles, nil
+}
+
+// I know, not ideal, but it works
+func getOutputEncoders(files []*os.File) []*json.Encoder {
+	nFiles := len(files)
+	encoders := make([]*json.Encoder, nFiles)
+
+	for i := 0; i < nFiles; i++ {
+		encoders[i] = json.NewEncoder(files[i])
+	}
+	return encoders
 }
 
 // Get one task from the coordinator
-func getTask() Reply {
+func getTask() (Reply, bool) {
 	args := Args{}
 	reply := Reply{}
-	call("Coordinator.GetTask", &args, &reply)
+	ok := call("Coordinator.GetTask", &args, &reply)
+	if !ok {
+		shouldStop = true // set the global variable
+		return reply, ok
+	}
+	return reply, ok
+}
+
+// rename all the tmp files to the final files with the correct name in {@code finalFilenames}
+func renameFiles(finalFilenames []string, tmpFiles []*os.File) bool {
+	if len(finalFilenames) < len(tmpFiles) {
+		log.Println("[ERROR]: Cannot rename files, finalFilenames and tmpFiles are not the same length")
+		return false
+	}
+
+	var encounteredError bool = false
+	for i, tmpFile := range tmpFiles {
+		tmpFilename := tmpFile.Name()
+		err := os.Rename(tmpFilename, finalFilenames[i])
+		if err != nil {
+			log.Printf("[ERROR]: Cannot rename files, %v\n", err.Error())
+			encounteredError = true
+		}
+	}
+	return !encounteredError
+}
+
+func checkError(err error, msg string) {
+	if err != nil {
+		log.Fatalf("[ERROR] %v: %v\n", msg, err.Error())
+	}
+	shouldStop = true
+	return
+}
+
+func notifyCoordinatorOnSuccess(args Args) Reply {
+	reply := Reply{}
+	call("Coordinator.TaskDone", &args, &reply)
 	return reply
 }
 
-func notifyCoordinator(args Args) {
-	reply := Reply{}
-	call("Coordinator.TaskDone", &args, &reply)
-}
-
-func notifyCoordinatorOnError(jobName, filename, errMessage string, taskNum int) {
+//TODO
+func notifyCoordinatorOnError(taskName, filename, errMessage string, taskNum int) {
 	reply := Reply{}
 	args := Args{
-		JobName:  jobName,
+		TaskName: taskName,
 		Filename: filename,
 		Status:   TaskError,
 		Message:  errMessage,
@@ -183,7 +261,10 @@ func notifyCoordinatorOnError(jobName, filename, errMessage string, taskNum int)
 	call("Coordinator.TaskError", &args, &reply)
 }
 
+// call(...) return false if the rpc returns an error
+//           return true if the rpc succeeded
 func call(rpcname string, args *Args, reply *Reply) bool {
+
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
@@ -200,27 +281,3 @@ func call(rpcname string, args *Args, reply *Reply) bool {
 	log.Println("[RPC]: ", err)
 	return false
 }
-
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-// func CallExample() {
-// 	// declare an argument structure.
-// 	args := ExampleArgs{}
-// 	// fill in the argument(s).
-// 	args.X = 99
-// 	// declare a reply structure.
-// 	reply := ExampleReply{}
-// 	// send the RPC request, wait for the reply.
-// 	call("Coordinator.Example", &args, &reply)
-// 	// reply.Y should be 100.
-// 	fmt.Printf("reply.Y %v\n", reply.Y)
-// }
-
-//
-// send an RPC request to the coordinator, wait for the response.
-// usually returns true.
-// returns false if something goes wrong.
-//
