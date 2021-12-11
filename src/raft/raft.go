@@ -83,12 +83,19 @@ type Raft struct {
 	dead      int32               // set by Kill()
 	state     int
 
+	//DO we even need this?
 	peersId []int // [0,1,2,3,4,5,6], should never change after init
+
 	// *Persistent* State on ALL SERVERS
 	// !IMPORTANT: Updated on stable storage before responding to RPCs
-	currentTerm int        // last term server has seen, init to 0 on boot, increase monotonically
-	votedFor    *int       // candidateId that received vote in current term, null if none
-	log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader, first index is 1
+	currentTerm int  // last term server has seen, init to 0 on boot, increase monotonically
+	votedFor    *int // candidateId that received vote in current term, null if none
+	/* log entries; each entry contains command for state machine,
+	 * and term when entry was received by leader,
+	 * first index is 1, on init we add a place holder log entry into the log
+	 * to deal with this 1-index problem
+	 */
+	log []LogEntry
 
 	// Volatile State on ALL SERVERS
 	commitIndex int // index of highest log entry known to be committed(init to 0, increase monotonically)
@@ -205,31 +212,68 @@ type RequestVoteReply struct {
 	VoteGranted bool // true means candidates received vote
 }
 
-//
+// This function will hold the rf.mu lock
 // example RequestVote RPC handler.
 // Your code here (2A, 2B).
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	candidateTerm := args.Term
+	Println("Candidate Term: ", candidateTerm)
 	candidateId := args.CandidateId
-	candidateLastLogIndex := args.lastLogIndex
-	candidateLogTerm := args.lastLogTerm
+	candidateLastEntryIndex := args.lastLogIndex
+	candidateLastEntryTerm := args.lastLogTerm
 
-	rf.mu.Lock()
+	rf.mu.Lock() // lock the raft struct from here
 	defer rf.mu.Unlock()
 
+	var lastLogEntryIndex = len(rf.log)
+	var lastLogEntryTerm = rf.log[lastLogEntryIndex].Term
+	Printf("[Info]: This Instance has lastLogEntryIndex: %v, lastLogEntryTerm: %v\n", lastLogEntryIndex, lastLogEntryTerm)
+
+	currentTerm := rf.currentTerm
+	reply.Term = currentTerm // set Term in reply to currentTerm regardless
 	/* Receiver Implementation:
-	*  reply false if term < currentTerm
+	*  reply false if candidate's term < currentTerm
 	*  if votedFor is null or candidateId,
 	*  and candidate's log is at least up-to-date as receiver's log,
 	*  grant vote
 	 */
-	currentTerm := rf.currentTerm
-	reply.Term = currentTerm // put in the currentTerm regardless
 	if candidateTerm < currentTerm {
 		reply.VoteGranted = false
 		return
 	}
+	/* If the logs have last entries with different terms, then
+	 *  the log with the later term is more up-to-date. If the logs
+	 *  end with the same term, then whichever log is longer is
+	 *  more up-to-date.
+	 */
+	var candidateMoreUpToDate = isCandidateMoreUpToDate(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
+	Printf("[Info]: Candidate More Up-to-date? %v\n", candidateMoreUpToDate)
+	if candidateMoreUpToDate && (rf.votedFor == nil || (*rf.votedFor) == candidateId) {
+		// Grant Vote
+		reply.VoteGranted = true
+		*rf.votedFor = candidateId
+		Printf("[Info]: This Server %v, voted yes to candidateId %v\n", rf.me, candidateId)
+		return
+	}
+	// Otherwise, vote no
+	reply.VoteGranted = false
+}
 
+// Return true if CANDIDATE has more up-to-date log, false if candidate has more up-to-date log
+func isCandidateMoreUpToDate(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
+	/* From Paper: Raft determines which of two logs is more up-to-date
+	by comparing
+	the index and term of the last entries in the logs.
+	If the logs have last entries with different terms, then
+	the log with the later term is more up-to-date. If the logs
+	end with the same term, then whichever log is longer is
+	more up-to-date.
+	*/
+	if candidateLastEntryTerm > thisLastEntryTerm ||
+		(thisLastEntryTerm == candidateLastEntryTerm && candidateLastEntryIndex > thisLastEntryIndex) {
+		return true
+	}
+	return false
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -316,7 +360,7 @@ func (rf *Raft) killed() bool {
 // heartsbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-		var randomAmountOfTime = GetRandomTimeout(ELECTION_TIMER_LOWERBOUND, ELECTION_TIMER_UPPERBOUND, time.Millisecond)
+		//var randomAmountOfTime = GetRandomTimeout(ELECTION_TIMER_LOWERBOUND, ELECTION_TIMER_UPPERBOUND, time.Millisecond)
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
@@ -354,9 +398,12 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	// No need to init rf.dead, default init to 0
+	rf.state = Follower // On boot state is follower
+
 	rf.peersId = makePeersId(len(peers))
 
-	rf.state = Follower // On boot state is follower
+	rf.log = make([]LogEntry, 1)
+	rf.log = append(rf.log, LogEntry{Term: -1, Command: "Place Holder"})
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -372,7 +419,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 func GetRandomTimeout(lo, hi int, unit time.Duration) time.Duration {
 	if hi-lo < 0 || lo < 0 || hi < 0 {
 		Println("[WARNING]: getRandomTimeout: Param Error")
-		return time.Duration(0)
+		panic("[WARNING]: getRandomTimeout: Param Error")
 	}
 	return time.Duration(lo+rand.Intn(hi-lo)) * unit
 }
