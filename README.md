@@ -27,6 +27,7 @@
 - [Instructors' Guide to Raft](https://thesquareplanet.com/blog/instructors-guide-to-raft/)
 - [Raft Locking Advice](https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt)
 - [Raft Structure Advice](https://pdos.csail.mit.edu/6.824/labs/raft-structure.txt)
+- [John Ousterhout, UIUC lecture: Designing for Understandability: The Raft Consensus Algorithm](https://www.youtube.com/watch?v=vYp4LYbnnW8)
 - Make reading a bit easier: `document.querySelector('body').style.fontFamily = "Consolas"`
 
 ## Lab 3: KV Raft
