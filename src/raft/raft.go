@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -86,6 +88,8 @@ type Raft struct {
 	//DO we even need this?
 	peersId []int // [0,1,2,3,4,5,6], should never change after init
 
+	hb chan interface{}
+
 	// *Persistent* State on ALL SERVERS
 	// !IMPORTANT: Updated on stable storage before responding to RPCs
 	currentTerm int  // last term server has seen, init to 0 on boot, increase monotonically
@@ -133,6 +137,18 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -155,6 +171,23 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor *int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil {
+		Println("[Error] Decoding currentTerm")
+	}
+
+	if d.Decode(&votedFor) != nil {
+		Println("[Error] Decoding votedFor")
+	}
+
+	if d.Decode(&log) != nil {
+		Println("[Error] Decoding Log")
+	}
 }
 
 // Lab 2D
@@ -225,7 +258,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock() // lock the raft struct from here
 	defer rf.mu.Unlock()
 
-	var lastLogEntryIndex = len(rf.log)
+	var lastLogEntryIndex = len(rf.log) - 1
 	var lastLogEntryTerm = rf.log[lastLogEntryIndex].Term
 	Printf("[Info]: This Instance has lastLogEntryIndex: %v, lastLogEntryTerm: %v\n", lastLogEntryIndex, lastLogEntryTerm)
 
@@ -242,10 +275,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	/* If the logs have last entries with different terms, then
-	 *  the log with the later term is more up-to-date. If the logs
-	 *  end with the same term, then whichever log is longer is
-	 *  more up-to-date.
-	 */
+	   the log with the later term is more up-to-date. If the logs
+	   end with the same term, then whichever log is longer is
+	   more up-to-date.
+	*/
 	var candidateMoreUpToDate = isCandidateMoreUpToDate(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
 	Printf("[Info]: Candidate More Up-to-date? %v\n", candidateMoreUpToDate)
 	if candidateMoreUpToDate && (rf.votedFor == nil || (*rf.votedFor) == candidateId) {
@@ -359,14 +392,33 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
-		//var randomAmountOfTime = GetRandomTimeout(ELECTION_TIMER_LOWERBOUND, ELECTION_TIMER_UPPERBOUND, time.Millisecond)
+	for rf.killed() == false && rf.state == Follower {
+		// On every iteration, pick a new random timeout
+		var randomAmountOfTime = GetRandomTimeout(ELECTION_TIMER_LOWERBOUND, ELECTION_TIMER_UPPERBOUND, time.Millisecond)
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		//TODO:
+
+		var electionTimeoutCh = makeTimeoutChan(randomAmountOfTime)
+
+		select {
+		case <-rf.hb:
+			continue
+		case <-electionTimeoutCh:
+			// start election
+			// TODO: change to candidate, request vote, collect vote
+		}
 
 	}
+}
+
+func makeTimeoutChan(timeout time.Duration) <-chan interface{} {
+	var ch = make(chan interface{}, 0)
+	go func() {
+		time.Sleep(timeout)
+		ch <- struct{}{}
+	}()
+	return ch
 }
 
 func makePeersId(length int) []int {
@@ -401,9 +453,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.state = Follower // On boot state is follower
 
 	rf.peersId = makePeersId(len(peers))
-
+	rf.hb = make(chan interface{}, 0) // for heartbeat, channel itself is synchonized
 	rf.log = make([]LogEntry, 1)
-	rf.log = append(rf.log, LogEntry{Term: -1, Command: "Place Holder"})
+	rf.log = append(rf.log, LogEntry{Term: 0, Command: "Place Holder"}) // Maybe?
 
 	// Your initialization code here (2A, 2B, 2C).
 
