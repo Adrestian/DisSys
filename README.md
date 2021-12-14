@@ -11,7 +11,10 @@
 - write a distributed `grep`
 ## [Lab 2: Raft](https://pdos.csail.mit.edu/6.824/labs/lab-raft.html)
 ### Lab 2A: Leader Election
-- In Progress
+- **Finished**
+- Test:
+    1. `cd src/raft`
+    2. `go test -run 2A -race`
 
 
 ### Lab 2B: Log
