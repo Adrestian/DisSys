@@ -32,18 +32,17 @@ import (
 )
 
 const (
-	CHECK_COMMIT_INTERVAL int = 500
+	CHECK_COMMIT_INTERVAL int = 500 // Currently not used anywhere
 
-	TICKER_SLEEP_INTERVAL int = 25
+	TICKER_SLEEP_INTERVAL int = 25 // used in {@code ticker()} to sleep rather than spinning
 
-	LEADER_HB_INTERVAL int = 100 // leader sends out hb periodically
+	LEADER_HB_INTERVAL int = 100 // Time interval where leader sends out heartbeat to all followers
 
-	ELECTION_TIMER_LO int = 200
-	ELECTION_TIMER_HI int = 500
+	ELECTION_TIMER_LO int = 200 // Candidate's election timeout lower and upper bound
+	ELECTION_TIMER_HI int = 500 // on timeout, increment term and start a new election
 
-	HB_TIMER_LOWERBOUND     int = 200
-	HB_TIMER_UPPERBOUND     int = 1000
-	ELECTION_TIMER_INTERVAL int = HB_TIMER_UPPERBOUND - HB_TIMER_LOWERBOUND
+	HB_TIMER_LOWERBOUND int = 200  // Follower's heartbeat timeout lower and upper bound
+	HB_TIMER_UPPERBOUND int = 1000 // on timeout, follower become candidate and start a new election
 )
 
 // Init to 2, 4, 8 for no particular reason, as long as not 0
@@ -52,9 +51,7 @@ const (
 	Leader    int = 2
 	Candidate int = 4
 	Follower  int = 8
-)
 
-const (
 	NULL int = -1
 )
 
@@ -673,7 +670,7 @@ func (rf *Raft) startElection() bool {
 					if rf.currentVotes == rf.majorityVotes {
 						rf.state = Leader
 						rf.mu.Unlock()
-						rf.sendHeartbeatToAllFollowers() //immediatedly sends out one round of broadcast heartbeat
+						rf.SendHeartbeatToAllFollowers() //immediatedly sends out one round of broadcast heartbeat
 						go func() {
 							leaderElectionSuccessCh <- struct{}{}
 						}()
@@ -716,7 +713,7 @@ func (rf *Raft) heartbeatRoutine(heartbeatTimeInterval time.Duration) {
 		rf.mu.Unlock()
 
 		if state == Leader {
-			rf.sendHeartbeatToAllFollowers()
+			rf.SendHeartbeatToAllFollowers()
 		}
 
 		time.Sleep(heartbeatTimeInterval)
@@ -762,7 +759,7 @@ func (rf *Raft) SendHeartBeat(server int, args *AppendEntriesArgs) (*AppendEntri
 }
 
 // This function is called by the leader periodically
-func (rf *Raft) sendHeartbeatToAllFollowers() {
+func (rf *Raft) SendHeartbeatToAllFollowers() {
 	rf.mu.Lock()
 	var state = rf.state
 	rf.mu.Unlock()
