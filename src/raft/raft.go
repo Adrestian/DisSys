@@ -34,7 +34,7 @@ import (
 const (
 	CHECK_COMMIT_INTERVAL int = 500
 
-	LEADER_SLEEP_INTERVAL int = 20
+	TICKER_SLEEP_INTERVAL int = 25
 
 	LEADER_HB_INTERVAL int = 100 // leader sends out hb periodically
 
@@ -58,6 +58,7 @@ const (
 	NULL int = -1
 )
 
+// {@code AppendEntries} RPC handler will push something into this channel to notify there's an hb from the leader
 var hb chan interface{} = make(chan interface{})
 
 //
@@ -350,17 +351,15 @@ type RequestVoteReply struct {
 // args are filled by candidate
 // reply are filled by follower(this handler)
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.ConvertToFollowerIfNeeded(args.Term)
+
 	candidateTerm := args.Term
 	candidateId := args.CandidateId
 	candidateLastEntryIndex := args.LastLogIndex
 	candidateLastEntryTerm := args.LastLogTerm
 
-	rf.ConvertToFollowerIfNeeded(args.Term)
-
-	rf.mu.Lock() // lock the raft struct from here
+	rf.mu.Lock() // <--------------------------lock the raft struct from here
 	defer rf.mu.Unlock()
-
-	Printf("[Server %v Receive Vote Request]  From Candidate %v, ServerTerm: %v, CandidateTerm: %v\n", rf.me, args.CandidateId, rf.currentTerm, candidateTerm)
 
 	var lastLogEntryIndex = len(rf.log) - 1
 	var lastLogEntryTerm = rf.log[lastLogEntryIndex].Term
@@ -374,46 +373,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	*  grant vote
 	 */
 	if candidateTerm < currentTerm { // candidate is out of date!
-		Printf("[Refused Vote]: server %v received vote requst from %v, candidate has lower term\n", rf.me, candidateId)
 		reply.VoteGranted = false
 		return
 	}
 	/* If the logs have last entries with different terms, then
 	   the log with the later term is more up-to-date. If the logs
 	   end with the same term, then whichever log is longer is
-	   more up-to-date.
+	   more up-to-date. Vote yes if candidate's log is at least as up-to-date as this raft instance
 	*/
-	var candidateMoreUpToDate = isCandidateMoreUpToDate(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
-	if candidateMoreUpToDate && (rf.votedFor == NULL || rf.votedFor == candidateId) {
+	var candidateLogOk = isCandidateAsUpToDate(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
+	if candidateLogOk && (rf.votedFor == NULL || rf.votedFor == candidateId) {
 		// Grant Vote
 		if rf.state == Follower {
 			reply.VoteGranted = true
 			rf.votedFor = candidateId
-			Printf("[Info]: Server %v, voted YES to candidateId %v\n", rf.me, candidateId)
 		}
 		return
 	}
-	// Otherwise, vote no
-	// ################  DEBUG ONLY
-	Printf("Server %v voted NO to candidateId %v, candidate log good? %v\n", rf.me, candidateId, candidateMoreUpToDate)
-	if Debug {
-		if !candidateMoreUpToDate {
-			Printf("because candidate is not as good as uptodate")
-		}
-		if rf.votedFor != NULL || rf.votedFor != candidateId {
-			Printf("because server %v Already Voted for %v in term %v\n", rf.me, rf.votedFor, rf.currentTerm)
-		}
-	}
-	// ################## DEBUG ONLY
 
+	// Otherwise, vote no
 	reply.VoteGranted = false
 	return
 }
 
 // Check if the candidate log is ok
-// Return true if CANDIDATE is at least as up to date as this receiver's log, ONE of the conditions to vote yes
-// Return false if candidate has out of date log, vote no
-func isCandidateMoreUpToDate(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
+// Return true if CANDIDATE is at least as up to date as this receiver's log, this is only ONE of the conditions to vote yes
+// Return false if candidate has out of date log
+func isCandidateAsUpToDate(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
 	/* From Paper: Raft determines which of two logs is more up-to-date
 	by comparing
 	the index and term of the last entries in the logs.
@@ -462,14 +448,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// NOTE: maybe we should let this function capture what to sen, not building args inside this function
 // should think about the interface, what to return
 // SendRequestVote is a wrapper function over sendRequestVote, return the pointer to the reply and an boolean(ok in sendRequestVote)
-func (rf *Raft) SendRequestVote(server int) (*RequestVoteReply, bool) {
-	rf.mu.Lock() // <-----mutex locks here
-
+func (rf *Raft) SendRequestVote(server int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
 	if server == rf.me {
 		panic("Send request vote to itself, wtf?")
 	}
+
+	reply := &RequestVoteReply{}
+
+	ok := rf.sendRequestVote(server, args, reply)
+	return reply, ok
+}
+
+// Construct a new RequestVoteArgs struct and return the pointer to the struct
+// This function does NOT acquire the lock inside the raft instance i.e {@code rf.mu}
+func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
 	var lastLogIndex = len(rf.log) - 1
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -477,11 +472,7 @@ func (rf *Raft) SendRequestVote(server int) (*RequestVoteReply, bool) {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
-	reply := &RequestVoteReply{}
-
-	rf.mu.Unlock() // <-----mutex unlocks here
-	ok := rf.sendRequestVote(server, args, reply)
-	return reply, ok
+	return args
 }
 
 //
@@ -552,13 +543,13 @@ func (rf *Raft) ticker() {
 				go rf.startElection()
 			}
 		} else if state == Candidate { // state == Candidate, do nothing for a while
-			time.Sleep(time.Duration(LEADER_SLEEP_INTERVAL) * time.Millisecond)
+			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
 
 		} else if state == Leader { // state == Leader, do nothing for a while
-			time.Sleep(time.Duration(LEADER_SLEEP_INTERVAL) * time.Millisecond)
+			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
 
 		} else { // unknown raft state
-			time.Sleep(time.Duration(LEADER_SLEEP_INTERVAL) * time.Millisecond)
+			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
 		}
 	}
 }
@@ -660,8 +651,12 @@ func (rf *Raft) startElection() bool {
 
 		for i := range rf.peers {
 			if i != rf.me {
-				go func(server int) {
-					reply, ok := rf.SendRequestVote(server)
+				rf.mu.Lock()
+				var requestVoteArgs = rf.NewRequestVoteArgs()
+				rf.mu.Unlock()
+
+				go func(server int, args *RequestVoteArgs) {
+					reply, ok := rf.SendRequestVote(server, args)
 
 					if convertToFollower := rf.ConvertToFollowerIfNeeded(reply.Term); convertToFollower {
 						return
@@ -685,7 +680,7 @@ func (rf *Raft) startElection() bool {
 						return
 					}
 					rf.mu.Unlock() // <---- unlock here
-				}(i) // send RPC in parallel
+				}(i, requestVoteArgs) // send RPC in parallel
 			}
 		}
 
@@ -730,7 +725,7 @@ func (rf *Raft) heartbeatRoutine(heartbeatTimeInterval time.Duration) {
 
 // Returns a (pointer to) prepared AppendEntriesArgs struct
 // this function does not hold lock while doing so
-func (rf *Raft) newAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
+func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -739,7 +734,7 @@ func (rf *Raft) newAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntr
 		Entries:      rf.log[rf.nextIndex[server]-1:],
 		LeaderCommit: rf.commitIndex,
 	}
-	if useEmptyEntry {
+	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
 		args.Entries = []LogEntry{}
 	}
 	return args
@@ -750,26 +745,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// TODO: there's still something to do! check figure 2!
-func (rf *Raft) SendAppendEntries(server int) (*AppendEntriesReply, bool) {
-	Println("[Info]: SendAppendEntries from: ", rf.me, " to ", server)
+// Request AppendEntries RPC call,
+// this function does not acquire the lock inside raft instance
+func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
 	reply := &AppendEntriesReply{}
-
-	rf.mu.Lock()
-	args := rf.newAppendEntriesArgs(server, false)
-	rf.mu.Unlock()
-
 	ok := rf.sendAppendEntries(server, args, reply)
 	return reply, ok
 }
 
 // Send AppendEntries RPC call with empty log entries, will require locks
-func (rf *Raft) SendHeartBeat(server int) (*AppendEntriesReply, bool) {
+func (rf *Raft) SendHeartBeat(server int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
 	reply := &AppendEntriesReply{}
-
-	rf.mu.Lock()
-	args := rf.newAppendEntriesArgs(server, true)
-	rf.mu.Unlock()
 
 	ok := rf.sendAppendEntries(server, args, reply)
 	return reply, ok
@@ -786,8 +772,13 @@ func (rf *Raft) sendHeartbeatToAllFollowers() {
 	}
 	for i := range rf.peers {
 		if i != rf.me {
-			go func(server int) {
-				reply, ok := rf.SendHeartBeat(server)
+
+			rf.mu.Lock()
+			var appendEntriesArgs = rf.NewAppendEntriesArgs(i, true)
+			rf.mu.Unlock()
+
+			go func(server int, args *AppendEntriesArgs) { // maybe some issue?
+				reply, ok := rf.SendHeartBeat(server, args)
 				rf.ConvertToFollowerIfNeeded(reply.Term)
 
 				if ok && reply.Success { // RPC success and follower reply yes
@@ -796,7 +787,7 @@ func (rf *Raft) sendHeartbeatToAllFollowers() {
 
 				} else { // RPC failed
 				}
-			}(i)
+			}(i, appendEntriesArgs)
 		}
 	}
 }

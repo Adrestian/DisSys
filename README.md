@@ -18,7 +18,7 @@
 
 
 ### Lab 2B: Log
-- Idle
+- In Progress...
 ### Lab 2C: Persistence
 - Idle
 ### Lab 2D: Log Compaction
