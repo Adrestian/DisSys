@@ -537,7 +537,11 @@ func (rf *Raft) ticker() {
 				continue
 			case <-electionTimeoutCh:
 				Printf("[Server %v] Haven't received any HB, Election Timeout\n", rf.me)
-				go rf.startElection()
+				rf.mu.Lock()
+				rf.state = Candidate
+				rf.mu.Unlock()
+				// crucial, so in the next iteration of {@code ticker()} {@code else if state == Candidate} branch will be taken regardless how the runtime schedule rf.startElection go routing
+				go rf.startElection() // after {@code rf.startElection()}, the state become Candidate so ticker() will do nothing
 			}
 		} else if state == Candidate { // state == Candidate, do nothing for a while
 			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
