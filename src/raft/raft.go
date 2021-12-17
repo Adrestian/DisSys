@@ -43,6 +43,8 @@ const (
 
 	HB_TIMER_LOWERBOUND int = 200  // Follower's heartbeat timeout lower and upper bound
 	HB_TIMER_UPPERBOUND int = 1000 // on timeout, follower become candidate and start a new election
+
+	SEND_FOLLOWER_SLEEP int = 20
 )
 
 // Init to 2, 4, 8 for no particular reason, as long as not 0
@@ -240,6 +242,9 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int  // current term, for leader to update itself
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XTerm   int  // Term of conflicting entry
+	XIndex  int  // index of first entry with Conflicting Term(Xterm)
+	XLen    int  // length of the follower's log
 }
 
 // Helper function to check if this raft instance should become a follower
@@ -256,6 +261,20 @@ func (rf *Raft) ConvertToFollowerIfNeeded(argsTerm int) bool {
 	return false
 }
 
+func (rf *Raft) findXIndex(xterm int) int {
+	var i int
+	for i = len(rf.log) - 1; i >= 1; i-- {
+		if rf.log[i].Term == xterm {
+			break
+		}
+	}
+
+	if i <= 0 {
+		i = 1
+	}
+	return i
+}
+
 // To implement heartbeats, define an AppendEntries RPC struct
 // (though you may not need all the arguments yet),
 // and have the leader send them out periodically.
@@ -265,6 +284,7 @@ func (rf *Raft) ConvertToFollowerIfNeeded(argsTerm int) bool {
 // args is filled by the leader
 // reply is filled by follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
 	var term = args.Term
 	rf.ConvertToFollowerIfNeeded(args.Term)
 	// var leaderId = args.LeaderId
@@ -279,6 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm // send out currentTerm regardless
 
 	if term < rf.currentTerm {
+		Printf2B("Outdated TERM: %v, currentTerm :%v\n", term, rf.currentTerm)
 		reply.Success = false
 		return
 	} // Reply false if term < currentTerm, Section 5.1(outdated information)
@@ -287,22 +308,60 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		hb <- struct{}{}
 	}() // reset the timer
 
-	if prevLogIndex >= len(rf.log) || prevLogIndex < 0 || rf.log[prevLogIndex].Term != prevLogTerm {
-		reply.Success = false
+	// 3 cases Lecture 7  @ 27:00
+	if prevLogIndex < 0 {
+		panic("leader sends a invalid entry")
+	}
+
+	if prevLogIndex >= len(rf.log) { // case 3, follower missing the entry
+		// Printf2B("[server %v]Follower missing entry\n", rf.me)
+		setReply(reply, false)
+		reply.XLen = len(rf.log)
+		reply.XTerm = rf.log[len(rf.log)-1].Term
+		reply.XIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
+		// Printf2B("Conflicting Index is %v\n", reply.XIndex)
+		// TODO: further modify and give leader information
+		Printf2B("[server %v]Reply is %+v\n", rf.me, reply)
+		Printf2B("[server %v] Log is %+v\n", rf.me, rf.log)
 		return
-	} // Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	} else if prevLogIndex < len(rf.log) && rf.log[prevLogIndex].Term != prevLogTerm {
+		// case 1 and 2
+		Printf2B("Follower log doesn't match")
+		setReply(reply, false)
+		reply.XLen = len(rf.log)
+		reply.XTerm = rf.log[len(rf.log)-1].Term
+		reply.XIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
+		Printf2B("Conflicting Index is %v\n", reply.XIndex)
+		return
+	}
 
 	/* 3. If an existing entry conflicts with a new one (same index but different terms),
 	delete the existing entry and all that follow it (5.3) */
-
-	/* 4. Append any new entry not already in the log */
-
-	if prevLogIndex < len(rf.log) && prevLogIndex >= 0 {
-		rf.log = rf.log[:prevLogIndex+1] // clip the follower log
-		if len(entries) != 0 {
+	var currLogIdx = prevLogIndex + 1
+	if currLogIdx < len(rf.log) && len(entries) != 0 && currLogIdx >= 0 { // we do have an existing entry at currLogIdx
+		if rf.log[currLogIdx].Term != entries[0].Term {
+			// Truncate the log and append
+			rf.log = rf.log[:currLogIdx]
+			rf.log = append(rf.log, entries...) // append the log
+			Printf2B("Clip and append the log")
+		} else {
+			Printf2B("Outdated log?\n")
+			// out dated, do nothing
+		}
+	} else if currLogIdx == len(rf.log) && len(entries) != 0 { /* 4. Append any new entry not already in the log */
+		if rf.log[prevLogIndex].Term == prevLogTerm {
+			Printf2B("[server %v] Entry: %+v\n", rf.me, entries)
+			Printf2B("[server %v] before appending %+v\n", rf.me, rf.log)
 			rf.log = append(rf.log, entries...)
-		} // append the entries to follower log
+			Printf2B("[Server %v] after append: log: %+v\n", rf.me, rf.log)
+		} else {
+			Printf2B("[server %v] something is wrong\n", rf.me)
+		}
+	} else {
+		Printf2B("[server %v] why?, leader is: %v\n", rf.me, args.LeaderId)
 	}
+	setReply(reply, true)
 
 	/* 5. if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) */
 
@@ -310,6 +369,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(leaderCommit, len(rf.log)-1)
 	}
 
+}
+
+func setReply(reply *AppendEntriesReply, success bool) {
+	if success {
+		reply.Success = true
+		reply.XIndex = -1
+		reply.XTerm = -1
+		reply.XLen = -1
+	} else {
+		reply.Success = false
+	}
 }
 
 // Find the minimum amoug all the integers
@@ -497,12 +567,98 @@ func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
 // Your code here (2B).
 func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+
 	index = len(rf.log)
 	term = rf.currentTerm
 	isLeader = rf.state == Leader
+	rf.mu.Unlock()
+
+	if isLeader {
+		// make a new Entry
+		var newEntry = make([]LogEntry, 1)
+		newEntry = append(newEntry, LogEntry{Term: term, Command: command})
+		// append entry to local log
+		rf.mu.Lock()
+		rf.log = append(rf.log, newEntry...)
+		rf.mu.Unlock()
+
+		// send folloer all the log
+	}
+
 	// TODO: and start agreement here
 	return
+}
+
+////• If successful: update nextIndex and matchIndex for
+//follower (§5.3)
+//• If AppendEntries fails because of log inconsistency:
+//decrement nextIndex and retry (§5.3)
+// This Go routing repeatedly check and send follower log if necessary
+func (rf *Raft) SendFollowerLog() {
+	for rf.killed() == false {
+
+		rf.mu.Lock()
+		var state = rf.state
+		rf.mu.Unlock()
+		if state != Leader {
+			time.Sleep(time.Duration(SEND_FOLLOWER_SLEEP) * time.Millisecond) // 20 ms
+			continue
+		}
+
+		for server := range rf.peers {
+			if server != rf.me {
+				// make a log and send follower the log
+				//If last log index ≥ nextIndex for a follower:
+				rf.mu.Lock()
+				var lastLogIndex = len(rf.log) - 1
+				var followerNextIndex = rf.nextIndex[server]
+				if lastLogIndex >= followerNextIndex {
+					// send follower the log!
+					var args = rf.NewAppendEntriesArgs(server, false)
+					Printf2B("[at leader %v], send to follower %v, with args %+v\n", rf.me, server, args)
+					Printf2B("[at leader %v], leader log %+v\n", rf.me, rf.log)
+					Printf("[at leader %v], rf.nextIndex[server]: %v\n", rf.me, rf.nextIndex[server])
+					//Printf2B("Sending out args: %+v at %v\n", args, rf.me)
+					//send AppendEntries RPC with log entries starting at nextIndex
+
+					go func(server int, args *AppendEntriesArgs) {
+						reply, ok := rf.SendAppendEntries(server, args)
+
+						if ok && reply.Success {
+							rf.mu.Lock()
+							var entrylen = len(args.Entries)
+							rf.nextIndex[server] += entrylen
+							rf.mu.Unlock()
+							return
+
+						} else if ok && !reply.Success {
+							Printf2B("in ok && !reply.Success\n")
+							rf.mu.Lock()
+							rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1) // for now
+							rf.mu.Unlock()
+						} else {
+							Printf("RPC from %v to %v failed\n", rf.me, server)
+						}
+					}(server, args)
+
+				}
+				rf.mu.Unlock()
+			}
+		}
+	}
+}
+
+func max(nums ...int) int {
+	if len(nums) == 0 {
+		panic("slice is zero length in max()")
+	}
+	var current = nums[0]
+	for _, num := range nums {
+		if num > current {
+			current = num
+		}
+	}
+	return current
 }
 
 //
@@ -658,6 +814,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeatRoutine(time.Duration(LEADER_HB_INTERVAL) * time.Millisecond)
+	go rf.SendFollowerLog()
 
 	return rf
 }
@@ -767,16 +924,27 @@ func (rf *Raft) heartbeatRoutine(heartbeatTimeInterval time.Duration) {
 // Returns a (pointer to) prepared AppendEntriesArgs struct
 // this function does not hold lock while doing so
 func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
+	// defer func() {
+	// 	if r := recover(); r != nil {
+	// 		Println(r)
+	// 		Printf2B("PrevLogIndex: %v, rf.log: %+v \n", rf.nextIndex[server]-1, rf.log)
+	// 	}
+	// }()
+	//Printf2B("PrevLogIndex: %v, log: %+v, rf.nextIndex: %+v\n", rf.nextIndex[server]-1, rf.log, rf.nextIndex)
+	var prevLogIndex = rf.nextIndex[server] - 1
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: rf.nextIndex[server] - 1,
-		PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
-		Entries:      rf.log[rf.nextIndex[server]-1:],
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.log[prevLogIndex].Term,
+		Entries:      rf.log[rf.nextIndex[server]:],
 		LeaderCommit: rf.commitIndex,
 	}
 	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
-		args.Entries = []LogEntry{}
+		args.Entries = make([]LogEntry, 0)
+		if len(args.Entries) != 0 {
+			panic("not empty entry")
+		}
 	}
 	return args
 }
