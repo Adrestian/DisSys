@@ -56,7 +56,14 @@ const (
 )
 
 // {@code AppendEntries} RPC handler will push something into this channel to notify there's an hb from the leader
-var hb chan interface{} = make(chan interface{})
+var (
+	//If election timeout elapses without receiving AppendEntries RPC from
+	// current leader or granting vote to candidate: convert to candidate
+	hb chan interface{} = make(chan interface{})
+
+	lastVotedMu sync.Mutex
+	lastVoted   time.Time
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -162,7 +169,6 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
-//
 // restore previously persisted state.
 //// Your code here (2C).
 func (rf *Raft) readPersist(data []byte) {
@@ -199,7 +205,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = log
 	}
-
 }
 
 // Lab 2D
@@ -379,12 +384,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	   end with the same term, then whichever log is longer is
 	   more up-to-date. Vote yes if candidate's log is at least as up-to-date as this raft instance
 	*/
-	var candidateLogOk = isCandidateAsUpToDate(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
+	var candidateLogOk = isCandidateLogOk(lastLogEntryIndex, lastLogEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
 	if candidateLogOk && (rf.votedFor == NULL || rf.votedFor == candidateId) {
 		// Grant Vote
 		if rf.state == Follower {
 			reply.VoteGranted = true
 			rf.votedFor = candidateId
+			lastVotedMu.Lock()
+			defer lastVotedMu.Unlock()
+			lastVoted = time.Now()
 		}
 		return
 	}
@@ -397,7 +405,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // Check if the candidate log is ok
 // Return true if CANDIDATE is at least as up to date as this receiver's log, this is only ONE of the conditions to vote yes
 // Return false if candidate has out of date log
-func isCandidateAsUpToDate(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
+func isCandidateLogOk(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
 	/* From Paper: Raft determines which of two logs is more up-to-date
 	by comparing
 	the index and term of the last entries in the logs.
@@ -530,19 +538,35 @@ func (rf *Raft) ticker() {
 			var randomAmountOfTime = GetRandomTimeout(HB_TIMER_LOWERBOUND, HB_TIMER_UPPERBOUND, time.Millisecond)
 			// check if a leader election should
 			// be started and to randomize sleeping time using time.Sleep().
+			// make a electionTimeoutCh on each iteration
 			var electionTimeoutCh, _ = makeTimeoutChan(randomAmountOfTime)
+			var startTime = time.Now()
 
 			select {
 			case <-hb:
 				continue
 			case <-electionTimeoutCh:
-				Printf("[Server %v] Haven't received any HB, Election Timeout\n", rf.me)
 				// crucial, so in the next iteration of {@code ticker()}
+
+				lastVotedMu.Lock()
+				var lastVotedTime = lastVoted
+				lastVotedMu.Unlock()
+				if inTimeSpan(startTime, time.Now(), lastVotedTime) {
+					Printf("[server %v] Voted during last election timeout\n", rf.me)
+					continue
+				}
+
+				// received something from voted channel, so this raft instance has voted, continue to loop
+				// did not vote during election timeout, so convert to candidate
+				//  {@code else if state == Candidate} branch will be taken regardless how the Go runtime schedule rf.startElection go routing
+				// after {@code rf.startElection()}, the state become Candidate so ticker() will do nothing
+				Printf("[Server %v] Haven't received any HB, Election Timeout\n", rf.me)
+
 				rf.mu.Lock()
 				rf.state = Candidate
 				rf.mu.Unlock()
-				//  {@code else if state == Candidate} branch will be taken regardless how the Go runtime schedule rf.startElection go routing
-				go rf.startElection() // after {@code rf.startElection()}, the state become Candidate so ticker() will do nothing
+				go rf.startElection()
+
 			}
 		} else if state == Candidate { // state == Candidate, do nothing for a while
 			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
@@ -554,6 +578,19 @@ func (rf *Raft) ticker() {
 			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
 		}
 	}
+}
+
+// stolen from
+// https://stackoverflow.com/questions/55093676/checking-if-current-time-is-in-a-given-interval-golang/55093788
+func inTimeSpan(start, end, check time.Time) bool {
+	if start.Before(end) {
+		return !check.Before(start) && !check.After(end)
+	}
+	if start.Equal(end) {
+		return check.Equal(start)
+	}
+	panic("[error]: inTimeSpan() start after end!")
+	return !start.After(check) || !end.Before(check)
 }
 
 func makeTimeoutChan(timeout time.Duration) (chan interface{}, chan interface{}) {
@@ -614,6 +651,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	var now = time.Now()
+	lastVotedMu.Lock()
+	lastVoted = now.Add(time.Duration(-HB_TIMER_UPPERBOUND) * time.Millisecond)
+	lastVotedMu.Unlock()
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.heartbeatRoutine(time.Duration(LEADER_HB_INTERVAL) * time.Millisecond)
@@ -676,9 +717,7 @@ func (rf *Raft) startElection() bool {
 						rf.becomeLeader()
 						rf.mu.Unlock()                   // <----------one way to exit
 						rf.SendHeartbeatToAllFollowers() //immediatedly sends out one round of broadcast heartbeat
-						go func() {
-							leaderElectionSuccessCh <- struct{}{}
-						}()
+						leaderElectionSuccessCh <- struct{}{}
 						return
 					}
 					rf.mu.Unlock() // <---- another way to exit, unlock here
