@@ -732,6 +732,7 @@ func (rf *Raft) startElection() bool {
 		case <-leaderElectionSuccessCh:
 			return true
 		case <-hb: // new appendEntries arrived!
+			// row back currentTerm?
 			rf.mu.Lock()
 			rf.state = Follower
 			rf.mu.Unlock()
