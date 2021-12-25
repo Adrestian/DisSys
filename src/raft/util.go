@@ -18,12 +18,3 @@ func Println(a ...interface{}) (n int, err error) {
 	}
 	return 0, nil
 }
-
-const Debug2B = true
-
-func Printf2B(format string, a ...interface{}) (n int, err error) {
-	if Debug2B {
-		log.Printf(format, a...)
-	}
-	return 0, nil
-}

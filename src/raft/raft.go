@@ -18,15 +18,12 @@ package raft
 //
 
 import (
-	//	"bytes"
-
 	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -140,7 +137,7 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
-	Printf("[Server %v]:GetState(): Term %v, isLeader: %v, voted For: %v\n", rf.me, term, isLeader, rf.votedFor)
+	//Printf("[Server %v]:GetState(): Term %v, isLeader: %v, voted For: %v\n", rf.me, term, isLeader, rf.votedFor)
 	return term, isLeader
 }
 
@@ -240,11 +237,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int  // current term, for leader to update itself
-	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-	XTerm   int  // Term of conflicting entry
-	XIndex  int  // index of first entry with Conflicting Term(Xterm)
-	XLen    int  // length of the follower's log
+	Term          int  // current term, for leader to update itself
+	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictTerm  int  // Term of conflicting entry
+	ConflictIndex int  // index of first entry with Conflicting Term(Xterm)
+	ConflictLen   int  // length of the follower's log
 }
 
 // Helper function to check if this raft instance should become a follower
@@ -268,7 +265,6 @@ func (rf *Raft) findXIndex(xterm int) int {
 			break
 		}
 	}
-
 	if i <= 0 {
 		i = 1
 	}
@@ -284,9 +280,9 @@ func (rf *Raft) findXIndex(xterm int) int {
 // args is filled by the leader
 // reply is filled by follower
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
-	var term = args.Term
+	// check RPC requst's term
 	rf.ConvertToFollowerIfNeeded(args.Term)
+	var term = args.Term
 	// var leaderId = args.LeaderId
 	var prevLogIndex = args.PrevLogIndex
 	var prevLogTerm = args.PrevLogTerm
@@ -298,8 +294,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm // send out currentTerm regardless
 
+	// outdated RPC
 	if term < rf.currentTerm {
-		Printf2B("Outdated TERM: %v, currentTerm :%v\n", term, rf.currentTerm)
+		//Printf("Outdated TERM: %v, currentTerm :%v\n", term, rf.currentTerm)
 		reply.Success = false
 		return
 	} // Reply false if term < currentTerm, Section 5.1(outdated information)
@@ -313,55 +310,58 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		panic("leader sends a invalid entry")
 	}
 
-	if prevLogIndex >= len(rf.log) { // case 3, follower missing the entry
-		// Printf2B("[server %v]Follower missing entry\n", rf.me)
-		setReply(reply, false)
-		reply.XLen = len(rf.log)
-		reply.XTerm = rf.log[len(rf.log)-1].Term
-		reply.XIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
-		// Printf2B("Conflicting Index is %v\n", reply.XIndex)
-		// TODO: further modify and give leader information
-		Printf2B("[server %v]Reply is %+v\n", rf.me, reply)
-		Printf2B("[server %v] Log is %+v\n", rf.me, rf.log)
-		return
-		// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
-	} else if prevLogIndex < len(rf.log) && rf.log[prevLogIndex].Term != prevLogTerm {
-		// case 1 and 2
-		Printf2B("Follower log doesn't match")
-		setReply(reply, false)
-		reply.XLen = len(rf.log)
-		reply.XTerm = rf.log[len(rf.log)-1].Term
-		reply.XIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
-		Printf2B("Conflicting Index is %v\n", reply.XIndex)
+	// if prevLogIndex >= len(rf.log) { // case 3, follower missing the entry
+	// 	Printf("[server %v]Follower missing entry\n", rf.me)
+	// 	setReply(reply, false)
+	// 	reply.ConflictLen = len(rf.log)
+	// 	reply.ConflictTerm = rf.log[len(rf.log)-1].Term
+	// 	reply.ConflictIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
+	// 	Printf("Conflicting Index is %v\n", reply.ConflictIndex)
+	// 	// TODO: further modify and give leader information
+	// 	// Printf("[server %v]Reply is %+v\n", rf.me, reply)
+	// 	// Printf("[server %v] Log is %+v\n", rf.me, rf.log)
+	// 	return
+	// 	// Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm
+	// } else if prevLogIndex < len(rf.log) && rf.log[prevLogIndex].Term != prevLogTerm {
+	// 	// case 1 and 2
+	// 	// Printf("Follower log doesn't match")
+	// 	setReply(reply, false)
+	// 	reply.ConflictLen = len(rf.log)
+	// 	reply.ConflictTerm = rf.log[len(rf.log)-1].Term
+	// 	reply.ConflictIndex = rf.findXIndex(rf.log[len(rf.log)-1].Term)
+	// 	Printf("Conflicting Index is %v\n", reply.ConflictIndex)
+	// 	return
+	// }
+
+	// Reply false IMMEDIATELY if
+	// the log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+	if !rf.EntryInBound(prevLogIndex) || rf.log[prevLogIndex].Term != prevLogTerm {
+		reply.Success = false
 		return
 	}
 
 	/* 3. If an existing entry conflicts with a new one (same index but different terms),
 	delete the existing entry and all that follow it (5.3) */
 	var currLogIdx = prevLogIndex + 1
-	if currLogIdx < len(rf.log) && len(entries) != 0 && currLogIdx >= 0 { // we do have an existing entry at currLogIdx
-		if rf.log[currLogIdx].Term != entries[0].Term {
-			// Truncate the log and append
-			rf.log = rf.log[:currLogIdx]
-			rf.log = append(rf.log, entries...) // append the log
-			Printf2B("Clip and append the log")
-		} else {
-			Printf2B("Outdated log?\n")
-			// out dated, do nothing
-		}
-	} else if currLogIdx == len(rf.log) && len(entries) != 0 { /* 4. Append any new entry not already in the log */
-		if rf.log[prevLogIndex].Term == prevLogTerm {
-			Printf2B("[server %v] Entry: %+v\n", rf.me, entries)
-			Printf2B("[server %v] before appending %+v\n", rf.me, rf.log)
-			rf.log = append(rf.log, entries...)
-			Printf2B("[Server %v] after append: log: %+v\n", rf.me, rf.log)
-		} else {
-			Printf2B("[server %v] something is wrong\n", rf.me)
-		}
+
+	if rf.EntryInBound(currLogIdx) && len(entries) != 0 && rf.log[currLogIdx].Term != entries[0].Term {
+		// Have an existing entry at currLogIdx and conflicting(same index but different terms)
+		// Truncate the log and append
+		rf.log = rf.log[:currLogIdx]
+		rf.log = append(rf.log, entries...)
+		setReply(reply, true)
+
+		Printf("[server %v]Clip the log and append\n", rf.me)
+	} else if currLogIdx == len(rf.log) && rf.log[prevLogIndex].Term == prevLogTerm { /* 4. Append any new entry not already in the log */
+		// ideal scenario, just append
+		rf.log = append(rf.log, entries...)
+		setReply(reply, true)
+		Printf("[Server %v] after append: log: %+v\n", rf.me, rf.log)
 	} else {
-		Printf2B("[server %v] why?, leader is: %v\n", rf.me, args.LeaderId)
+		Printf("[server %v] Cannot append, leader is: %v\n", rf.me, args.LeaderId)
+		Printf("[server %v] Cannot append, prevLogIndex: %v, log length: %v\n", rf.me, prevLogIndex, len(rf.log))
+		setReply(reply, false)
 	}
-	setReply(reply, true)
 
 	/* 5. if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry) */
 
@@ -371,12 +371,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+// Check if the index is in bound of the log
+func (rf *Raft) EntryInBound(index int) bool {
+	if index <= 0 || index >= len(rf.log) {
+		return false
+	}
+	return true
+}
+
 func setReply(reply *AppendEntriesReply, success bool) {
 	if success {
 		reply.Success = true
-		reply.XIndex = -1
-		reply.XTerm = -1
-		reply.XLen = -1
+		reply.ConflictIndex = -1
+		reply.ConflictTerm = -1
+		reply.ConflictLen = -1
 	} else {
 		reply.Success = false
 	}
@@ -571,32 +579,28 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	index = len(rf.log)
 	term = rf.currentTerm
 	isLeader = rf.state == Leader
-	rf.mu.Unlock()
-
 	if isLeader {
 		// make a new Entry
-		var newEntry = make([]LogEntry, 1)
-		newEntry = append(newEntry, LogEntry{Term: term, Command: command})
+		var newEntry = LogEntry{Term: term, Command: command}
 		// append entry to local log
-		rf.mu.Lock()
-		rf.log = append(rf.log, newEntry...)
-		rf.mu.Unlock()
+		rf.log = append(rf.log, newEntry)
 
 		// send folloer all the log
 	}
+	rf.mu.Unlock()
 
 	// TODO: and start agreement here
 	return
 }
 
-////• If successful: update nextIndex and matchIndex for
+//TODO: Very buggy!
+// If successful: update nextIndex and matchIndex for
 //follower (§5.3)
-//• If AppendEntries fails because of log inconsistency:
+// If AppendEntries fails because of log inconsistency:
 //decrement nextIndex and retry (§5.3)
 // This Go routing repeatedly check and send follower log if necessary
 func (rf *Raft) SendFollowerLog() {
 	for rf.killed() == false {
-
 		rf.mu.Lock()
 		var state = rf.state
 		rf.mu.Unlock()
@@ -609,40 +613,44 @@ func (rf *Raft) SendFollowerLog() {
 			if server != rf.me {
 				// make a log and send follower the log
 				//If last log index ≥ nextIndex for a follower:
-				rf.mu.Lock()
+				rf.mu.Lock() // buggy
 				var lastLogIndex = len(rf.log) - 1
 				var followerNextIndex = rf.nextIndex[server]
 				if lastLogIndex >= followerNextIndex {
 					// send follower the log!
 					var args = rf.NewAppendEntriesArgs(server, false)
-					Printf2B("[at leader %v], send to follower %v, with args %+v\n", rf.me, server, args)
-					Printf2B("[at leader %v], leader log %+v\n", rf.me, rf.log)
+					// BUGGY! TODO:
+					Printf("[at leader %v], send to follower %v, with args %+v\n", rf.me, server, args)
+					Printf("[at leader %v], leader log %+v\n", rf.me, rf.log)
 					Printf("[at leader %v], rf.nextIndex[server]: %v\n", rf.me, rf.nextIndex[server])
 					//Printf2B("Sending out args: %+v at %v\n", args, rf.me)
 					//send AppendEntries RPC with log entries starting at nextIndex
 
 					go func(server int, args *AppendEntriesArgs) {
 						reply, ok := rf.SendAppendEntries(server, args)
+						rf.ConvertToFollowerIfNeeded(reply.Term)
+						Printf("[Server %v] Check reply after append entries call, no deadlock \n", rf.me)
 
 						if ok && reply.Success {
 							rf.mu.Lock()
 							var entrylen = len(args.Entries)
-							rf.nextIndex[server] += entrylen
+							rf.nextIndex[server] = rf.nextIndex[server] + entrylen
+							rf.matchIndex[server] = rf.nextIndex[server] + entrylen - 1
 							rf.mu.Unlock()
 							return
 
 						} else if ok && !reply.Success {
-							Printf2B("in ok && !reply.Success\n")
+							Printf("[server %v] Follower %v Reject the log\n", rf.me, server)
 							rf.mu.Lock()
 							rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1) // for now
 							rf.mu.Unlock()
 						} else {
-							Printf("RPC from %v to %v failed\n", rf.me, server)
+							Printf("[Server %v]RPC from leader %v to %v failed\n", rf.me, rf.me, server)
 						}
 					}(server, args)
 
 				}
-				rf.mu.Unlock()
+				rf.mu.Unlock() // buggy
 			}
 		}
 	}
@@ -691,11 +699,11 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		if state == Follower {
 			// On every iteration, pick a new random timeout
-			var randomAmountOfTime = GetRandomTimeout(HB_TIMER_LOWERBOUND, HB_TIMER_UPPERBOUND, time.Millisecond)
+			var randomAmount = GetRandomTimeout(HB_TIMER_LOWERBOUND, HB_TIMER_UPPERBOUND, time.Millisecond)
 			// check if a leader election should
 			// be started and to randomize sleeping time using time.Sleep().
 			// make a electionTimeoutCh on each iteration
-			var electionTimeoutCh, _ = makeTimeoutChan(randomAmountOfTime)
+			var electionTimeoutCh, _ = makeTimeoutChan(randomAmount)
 			var startTime = time.Now()
 
 			select {
@@ -703,7 +711,6 @@ func (rf *Raft) ticker() {
 				continue
 			case <-electionTimeoutCh:
 				// crucial, so in the next iteration of {@code ticker()}
-
 				lastVotedMu.Lock()
 				var lastVotedTime = lastVoted
 				lastVotedMu.Unlock()
@@ -711,12 +718,6 @@ func (rf *Raft) ticker() {
 					Printf("[server %v] Voted during last election timeout\n", rf.me)
 					continue
 				}
-
-				// received something from voted channel, so this raft instance has voted, continue to loop
-				// did not vote during election timeout, so convert to candidate
-				//  {@code else if state == Candidate} branch will be taken regardless how the Go runtime schedule rf.startElection go routing
-				// after {@code rf.startElection()}, the state become Candidate so ticker() will do nothing
-				Printf("[Server %v] Haven't received any HB, Election Timeout\n", rf.me)
 
 				rf.mu.Lock()
 				rf.state = Candidate
@@ -732,6 +733,7 @@ func (rf *Raft) ticker() {
 
 		} else { // unknown raft state
 			time.Sleep(time.Duration(TICKER_SLEEP_INTERVAL) * time.Millisecond)
+			Printf("[server %v] in unknown state\n", rf.me)
 		}
 	}
 }
@@ -746,7 +748,6 @@ func inTimeSpan(start, end, check time.Time) bool {
 		return check.Equal(start)
 	}
 	panic("[error]: inTimeSpan() start after end!")
-	return !start.After(check) || !end.Before(check)
 }
 
 func makeTimeoutChan(timeout time.Duration) (chan interface{}, chan interface{}) {
@@ -865,8 +866,9 @@ func (rf *Raft) startElection() bool {
 					if ok && reply.VoteGranted {
 						rf.currentVotes++
 					} else if ok { // vote not granted
-
+						//Printf("[server %v] Peer %v voted no\n", rf.me, server)
 					} else if !ok {
+						//Printf("[Server %v] RPC failed\n", rf.me)
 						// RPC Failed
 					}
 
@@ -977,7 +979,7 @@ func (rf *Raft) SendHeartbeatToAllFollowers() {
 	rf.mu.Unlock()
 
 	if state != Leader {
-		Printf("%v Sending HB but not leader, return\n", rf.me)
+		return
 	}
 	for i := range rf.peers {
 		if i != rf.me {
@@ -1002,6 +1004,8 @@ func (rf *Raft) SendHeartbeatToAllFollowers() {
 }
 
 // This function does not require the lock!
+// change the state to Follower,
+// set the currentTerm to newTerm and reset votedFor
 func (rf *Raft) becomeFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = NULL
