@@ -645,7 +645,7 @@ func (rf *Raft) SendFollowerLog() {
 							rf.mu.Lock()
 							var entrylen = len(args.Entries)
 							rf.nextIndex[server] = rf.nextIndex[server] + entrylen
-							rf.matchIndex[server] = rf.nextIndex[server] + entrylen - 1
+							rf.matchIndex[server] = args.PrevLogIndex + entrylen
 							Printf("[Leader %v]nextIndex[%v] is updated to %v\n", rf.me, server, rf.nextIndex[server])
 							rf.mu.Unlock()
 							return
@@ -653,7 +653,7 @@ func (rf *Raft) SendFollowerLog() {
 						} else if ok && !reply.Success { // TODO: handle RPC failures! BUGGY !
 							Printf("[server %v] Follower %v Reject the log\n", rf.me, server)
 							rf.mu.Lock()
-							rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1) // for now
+							rf.nextIndex[server] = max(rf.matchIndex[server]+1, 1) // for now
 							//rf.nextIndex[server] = rf.nextIndex[server] - 1       // for now // big BUG!
 							rf.mu.Unlock()
 						} else {
