@@ -31,7 +31,7 @@ import (
 const (
 	CHECK_COMMIT_INTERVAL int = 500 // Currently not used anywhere
 
-	TICKER_SLEEP_INTERVAL int = 25 // used in {@code ticker()} to sleep rather than spinning
+	TICKER_SLEEP_INTERVAL int = 100 // used in {@code ticker()} to sleep rather than spinning
 
 	LEADER_HB_INTERVAL int = 100 // Time interval where leader sends out heartbeat to all followers
 
@@ -41,7 +41,7 @@ const (
 	HB_TIMER_LOWERBOUND int = 200  // Follower's heartbeat timeout lower and upper bound
 	HB_TIMER_UPPERBOUND int = 1000 // on timeout, follower become candidate and start a new election
 
-	SEND_FOLLOWER_SLEEP int = 20
+	SEND_FOLLOWER_SLEEP int = 100
 )
 
 // Init to 2, 4, 8 for no particular reason, as long as not 0
