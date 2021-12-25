@@ -258,7 +258,7 @@ func (rf *Raft) ConvertToFollowerIfNeeded(argsTerm int) bool {
 	return false
 }
 
-func (rf *Raft) findXIndex(xterm int) int {
+func (rf *Raft) findConflictTerm(xterm int) int {
 	var i int
 	for i = len(rf.log) - 1; i >= 1; i-- {
 		if rf.log[i].Term == xterm {
@@ -296,7 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// outdated RPC
 	if term < rf.currentTerm {
-		//Printf("Outdated TERM: %v, currentTerm :%v\n", term, rf.currentTerm)
+		Printf("Outdated TERM: %v, currentTerm :%v\n", term, rf.currentTerm)
 		reply.Success = false
 		return
 	} // Reply false if term < currentTerm, Section 5.1(outdated information)
@@ -336,6 +336,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false IMMEDIATELY if
 	// the log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 	if !rf.EntryInBound(prevLogIndex) || rf.log[prevLogIndex].Term != prevLogTerm {
+		// if !rf.EntryInBound(prevLogIndex) {
+		// 	Printf("[Follower %v]: Reject the log because it is out of bound. Index: %v\n", rf.me, prevLogIndex)
+		// }
+		// if rf.log[prevLogIndex].Term != prevLogTerm {
+		// 	Printf("[Follower %v]: Reject the log, the term doesn't match, prevLogTerm: %v, lastTerm: %v", rf.me, prevLogTerm, rf.log[prevLogIndex].Term)
+		// }
 		reply.Success = false
 		return
 	}
@@ -358,8 +364,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		setReply(reply, true)
 		Printf("[Server %v] after append: log: %+v\n", rf.me, rf.log)
 	} else {
-		Printf("[server %v] Cannot append, leader is: %v\n", rf.me, args.LeaderId)
-		Printf("[server %v] Cannot append, prevLogIndex: %v, log length: %v\n", rf.me, prevLogIndex, len(rf.log))
+		// TODO: bug
+		Printf("[Follower %v], log: %+v\n", rf.me, rf.log)
+		Printf("[Follower %v] Cannot append, currLogIdx: %v\n, log length: %v thisLastEntryTerm: %v\n", rf.me, currLogIdx, len(rf.log), rf.log[prevLogIndex].Term)
+		Printf("[Follower %v] Cannot append, prevLogIndex: %v, log length: %v\n", rf.me, prevLogIndex, len(rf.log))
+		Printf("[Follower %v] receive args %+v\n", rf.me, args)
 		setReply(reply, false)
 	}
 
@@ -373,7 +382,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 // Check if the index is in bound of the log
 func (rf *Raft) EntryInBound(index int) bool {
-	if index <= 0 || index >= len(rf.log) {
+	if index < 0 || index >= len(rf.log) {
 		return false
 	}
 	return true
@@ -605,7 +614,7 @@ func (rf *Raft) SendFollowerLog() {
 		var state = rf.state
 		rf.mu.Unlock()
 		if state != Leader {
-			time.Sleep(time.Duration(SEND_FOLLOWER_SLEEP) * time.Millisecond) // 20 ms
+			time.Sleep(time.Duration(SEND_FOLLOWER_SLEEP) * time.Millisecond) // 100 ms
 			continue
 		}
 
@@ -629,20 +638,23 @@ func (rf *Raft) SendFollowerLog() {
 					go func(server int, args *AppendEntriesArgs) {
 						reply, ok := rf.SendAppendEntries(server, args)
 						rf.ConvertToFollowerIfNeeded(reply.Term)
-						Printf("[Server %v] Check reply after append entries call, no deadlock \n", rf.me)
+						// no dead lock here
+						//Printf("[Server %v] Check reply after append entries call, no deadlock \n", rf.me)
 
 						if ok && reply.Success {
 							rf.mu.Lock()
 							var entrylen = len(args.Entries)
 							rf.nextIndex[server] = rf.nextIndex[server] + entrylen
 							rf.matchIndex[server] = rf.nextIndex[server] + entrylen - 1
+							Printf("[Leader %v]nextIndex[%v] is updated to %v\n", rf.me, server, rf.nextIndex[server])
 							rf.mu.Unlock()
 							return
 
-						} else if ok && !reply.Success {
+						} else if ok && !reply.Success { // TODO: handle RPC failures! BUGGY !
 							Printf("[server %v] Follower %v Reject the log\n", rf.me, server)
 							rf.mu.Lock()
 							rf.nextIndex[server] = max(rf.nextIndex[server]-1, 1) // for now
+							//rf.nextIndex[server] = rf.nextIndex[server] - 1       // for now // big BUG!
 							rf.mu.Unlock()
 						} else {
 							Printf("[Server %v]RPC from leader %v to %v failed\n", rf.me, rf.me, server)
@@ -814,7 +826,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	lastVotedMu.Unlock()
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.heartbeatRoutine(time.Duration(LEADER_HB_INTERVAL) * time.Millisecond)
+	// go rf.heartbeatRoutine(time.Duration(LEADER_HB_INTERVAL) * time.Millisecond)
 	go rf.SendFollowerLog()
 
 	return rf
