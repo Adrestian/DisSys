@@ -36,15 +36,17 @@ const (
 )
 
 const (
-	FOLLOWER_HB_TIMEOUT_LOWER int = 300 // Lower and Upper bound for the timeout where the follower becomes candidate
-	FOLLOWER_HB_TIMEOUT_UPPER int = 700 // if no appendentries RPC has been received from leader or voted for other candidates
+	FOLLOWER_HB_TIMEOUT_LOWER int = 250  // Lower and Upper bound for the timeout where the follower becomes candidate
+	FOLLOWER_HB_TIMEOUT_UPPER int = 1250 // if no appendentries RPC has been received from leader or voted for other candidates
 
 	SEND_LOG_INTERVAL int = 100 // highest rate capped at 10/sec
-	TICKER_INTERVAL   int = 25
+	TICKER_INTERVAL   int = 15
 
-	ELECTION_TIMEOUT_LOWER     int = 250
-	ELECTION_TIMEOUT_UPPER     int = 1250
-	ELECTION_CHECKING_INTERVAL int = 20
+	ELECTION_TIMEOUT_LOWER     int = 300
+	ELECTION_TIMEOUT_UPPER     int = 800
+	ELECTION_CHECKING_INTERVAL int = 15
+
+	APPLY_LOG_INTERVAL int = 15
 )
 
 var (
@@ -90,7 +92,8 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	cond      *sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -476,6 +479,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Printf("[Server %v] AppendEntries RPC Handler returns %v\n", rf.me, reply.Success)
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.cond.Broadcast()
+		Printf("[Server %v] kicked applyLog\n", rf.me)
 	}
 
 	Printf("[Server %v] Log: %+v\n", rf.me, rf.log)
@@ -763,13 +768,15 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 	return false
 }
 
-func (rf *Raft) Commit(interval time.Duration) {
+// LeaderCommit routing is for leader only
+func (rf *Raft) LeaderCommit(interval time.Duration) {
 	for !rf.killed() {
 		rf.checkCommit()
 		time.Sleep(interval)
 	}
 }
 
+// Internal implementation of {@code func (rf *Raft) Commit(interval time.Duration)}
 func (rf *Raft) checkCommit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -787,6 +794,7 @@ func (rf *Raft) checkCommit() {
 		}
 		if count >= majority {
 			rf.commitIndex = N
+			rf.cond.Broadcast()
 			break
 		}
 	}
@@ -831,6 +839,51 @@ func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, r
 	return
 }
 
+func (rf *Raft) ApplyLogKicker(interval time.Duration) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		rf.cond.Broadcast()
+		rf.mu.Unlock()
+		time.Sleep(interval)
+	}
+}
+
+// If commitIndex > lastApplied: increment lastApplied, apply
+// log[lastApplied] to state machine (§5.3)
+func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
+	for !rf.killed() {
+		rf.mu.Lock()
+
+		for !(rf.commitIndex > rf.lastApplied) {
+			rf.cond.Wait()
+		}
+		// TODO: Apply changes
+
+		for rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			rf.applyLogEntry(rf.lastApplied, applyCh)
+		}
+
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
+	var applyMsg = rf.NewApplyMsg(applyIndex)
+	Printf("[Server %v] kicked applyLog\n", rf.me)
+	applyCh <- *applyMsg
+
+}
+
+func (rf *Raft) NewApplyMsg(applyIndex int) *ApplyMsg {
+	var applyMsg = ApplyMsg{
+		CommandValid: true,
+		Command:      rf.log[applyIndex].Command,
+		CommandIndex: applyIndex,
+	}
+	return &applyMsg
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -847,6 +900,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.cond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.becomeFollower(0) // on boot init to follower
@@ -868,8 +922,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)    // for state == Follower
-	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond) // for state == Leader
-	go rf.Commit(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)  // for checking commit, state == leader
+	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower
+	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)         // for state == Leader
+	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond)   // for checking commit, state == leader
+	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
+	go rf.ApplyLog(applyCh)
 	return rf
 }
