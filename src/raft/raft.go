@@ -669,17 +669,17 @@ func (rf *Raft) SendLog(interval time.Duration) {
 				}
 
 				var args = rf.NewAppendEntriesArgs(server, false)
-				// TODO:
-				Printf("[Leader %v] Send out log\n", rf.me)
+				Printf("[Leader %v] with term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
 				go func(server int, args *AppendEntriesArgs) {
 					var reply, ok = rf.SendAppendEntries(server, args)
+					var sentInTerm = args.Term
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					if ok && rf.ConvertToFollowerIfNeeded(reply.Term) {
 						return
 					}
 
-					if !ok || rf.state != Leader || rf.currentTerm != args.Term {
+					if !ok || rf.state != Leader || sentInTerm != reply.Term || rf.currentTerm != args.Term {
 						return
 					}
 					rf.AppendEntriesReplyHandler(server, args, reply)
@@ -711,6 +711,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 
 				go func(server int, args *RequestVoteArgs) {
 					reply, ok := rf.SendRequestVote(server, args)
+					var sentInTerm = args.Term
 
 					rf.mu.Lock() // lock acquired here
 					defer rf.mu.Unlock()
@@ -719,7 +720,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 						return
 					}
 
-					if args.Term != rf.currentTerm {
+					if sentInTerm != reply.Term || args.Term != rf.currentTerm {
 						return
 					}
 
@@ -818,13 +819,14 @@ func (rf *Raft) sendHB() {
 		var appendEntriesArgs = rf.NewAppendEntriesArgs(i, true)
 		go func(server int, args *AppendEntriesArgs) {
 			reply, ok := rf.SendAppendEntries(server, args)
+			var sentInTerm = args.Term
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if ok && rf.ConvertToFollowerIfNeeded(reply.Term) {
 				return
 			}
 
-			if !ok || rf.state != Leader || rf.currentTerm != args.Term {
+			if !ok || rf.state != Leader || sentInTerm != reply.Term || rf.currentTerm != args.Term {
 				return
 			} // RPC failed or outdated
 
@@ -835,7 +837,7 @@ func (rf *Raft) sendHB() {
 }
 
 func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if reply.Success == false {
+	if !reply.Success {
 		rf.nextIndex[server] = max(rf.nextIndex[server]-1, rf.matchIndex[server], 1)
 	} else if reply.Success {
 		var entryLen = len(args.Entries)
@@ -929,7 +931,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// start ticker goroutine to start elections
 	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower
 	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)         // for state == Leader
-	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond)   // for checking commit, state == leader
+	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL/2) * time.Millisecond) // for checking commit, state == leader
 	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
 	go rf.ApplyLog(applyCh)
 	return rf
