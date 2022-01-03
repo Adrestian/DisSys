@@ -37,16 +37,16 @@ const (
 
 const (
 	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
-	FOLLOWER_HB_TIMEOUT_UPPER int = 750 // if no appendentries RPC has been received from leader or voted for other candidates
+	FOLLOWER_HB_TIMEOUT_UPPER int = 900 // if no appendentries RPC has been received from leader or voted for other candidates
 
 	SEND_LOG_INTERVAL int = 100 // highest rate capped at 10/sec
-	TICKER_INTERVAL   int = 15
+	TICKER_INTERVAL   int = 10
 
 	ELECTION_TIMEOUT_LOWER     int = 300
 	ELECTION_TIMEOUT_UPPER     int = 800
-	ELECTION_CHECKING_INTERVAL int = 15
+	ELECTION_CHECKING_INTERVAL int = 10
 
-	APPLY_LOG_INTERVAL int = 15
+	APPLY_LOG_INTERVAL int = 10
 )
 
 var (
@@ -426,7 +426,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = append(rf.log, args.Entries...)
 		reply.Success = true // set reply.Success == True if folloer contained entry matching prevLogIndex and prevLogTerm
 	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) < len(rf.log) {
-		// check if match, otherwise clip the log
+		// check if match, otherwise clip the log,
 		// prevLogIndex == 3 in this case
 		// log      [1 2 3 4 5 6]
 		// entries        [4 5 6]
@@ -480,10 +480,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		rf.cond.Broadcast()
-		Printf("[Server %v] kicked applyLog\n", rf.me)
 	}
-
-	Printf("[Server %v] Log: %+v\n", rf.me, rf.log)
 	return
 }
 
@@ -670,6 +667,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 				if server == rf.me {
 					continue
 				}
+
 				var args = rf.NewAppendEntriesArgs(server, false)
 				// TODO:
 				Printf("[Leader %v] Send out log\n", rf.me)
@@ -783,17 +781,25 @@ func (rf *Raft) checkCommit() {
 	if rf.state != Leader {
 		return
 	} // Only leader check and set commitIndex
-	var majority = len(rf.peers)/2 - 1
+	var nPeers = len(rf.peers) - 1
+	var majority = nPeers/2 + 1
+	if nPeers%2 == 0 {
+		majority = nPeers / 2
+	}
 
 	for N := len(rf.log) - 1; N > rf.commitIndex && rf.log[N].Term == rf.currentTerm; N-- {
 		var count = 0
 		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
 			if rf.matchIndex[i] >= N {
 				count++
 			}
 		}
 		if count >= majority {
 			rf.commitIndex = N
+			rf.matchIndex[rf.me] = N
 			rf.cond.Broadcast()
 			break
 		}
@@ -830,7 +836,7 @@ func (rf *Raft) sendHB() {
 
 func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	if reply.Success == false {
-		rf.nextIndex[server] = max(rf.nextIndex[server]-1, rf.matchIndex[server])
+		rf.nextIndex[server] = max(rf.nextIndex[server]-1, rf.matchIndex[server], 1)
 	} else if reply.Success {
 		var entryLen = len(args.Entries)
 		rf.matchIndex[server] = args.PrevLogIndex + entryLen
@@ -839,6 +845,7 @@ func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, r
 	return
 }
 
+// Kick {@code (rf *Raft) ApplyLog()} periodically
 func (rf *Raft) ApplyLogKicker(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -857,7 +864,6 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 		for !(rf.commitIndex > rf.lastApplied) {
 			rf.cond.Wait()
 		}
-		// TODO: Apply changes
 
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
@@ -870,7 +876,6 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 
 func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
 	var applyMsg = rf.NewApplyMsg(applyIndex)
-	Printf("[Server %v] kicked applyLog\n", rf.me)
 	applyCh <- *applyMsg
 
 }
