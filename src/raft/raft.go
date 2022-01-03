@@ -36,8 +36,8 @@ const (
 )
 
 const (
-	FOLLOWER_HB_TIMEOUT_LOWER int = 250  // Lower and Upper bound for the timeout where the follower becomes candidate
-	FOLLOWER_HB_TIMEOUT_UPPER int = 1250 // if no appendentries RPC has been received from leader or voted for other candidates
+	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
+	FOLLOWER_HB_TIMEOUT_UPPER int = 750 // if no appendentries RPC has been received from leader or voted for other candidates
 
 	SEND_LOG_INTERVAL int = 100 // highest rate capped at 10/sec
 	TICKER_INTERVAL   int = 15
