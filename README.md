@@ -18,9 +18,10 @@
 
 
 ### Lab 2B: Log
-- In Progress...
+- *Finished*, except:
+    1. Fast log backup not implemented
 ### Lab 2C: Persistence
-- Idle
+- In Progress...
 ### Lab 2D: Log Compaction
 - Idle
 
