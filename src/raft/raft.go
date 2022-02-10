@@ -196,28 +196,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 //
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int // candidate's term
-	CandidateId  int // candidate requesting vote
-	LastLogIndex int // index of candidate's last log entry
-	LastLogTerm  int // term of candidate's last log entry
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int  // current term, for candidate to update it self
-	VoteGranted bool // true means candidates received vote
-}
-
-//
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -329,23 +307,6 @@ func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
 		LastLogTerm:  rf.log[lastLogIndex].Term,
 	}
 	return args
-}
-
-type AppendEntriesArgs struct {
-	Term         int        // leader's term
-	LeaderId     int        // so follower can redirect clients
-	PrevLogIndex int        // index of log entry immediately preceding new ones
-	PrevLogTerm  int        // term of the log entry at prevLogIndex
-	Entries      []LogEntry // log entries to store, empty for heartbeat messages
-	LeaderCommit int        // leader's commitIndex
-}
-
-type AppendEntriesReply struct {
-	Term          int  // current term, for leader to update itself
-	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-	ConflictTerm  int  // Term of conflicting entry
-	ConflictIndex int  // Index of first entry with conflicting term
-	ConflictLen   int  // length of the follower's log
 }
 
 // Reset the follower timer
