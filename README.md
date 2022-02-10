@@ -20,6 +20,9 @@
 ### Lab 2B: Log
 - *Finished*, except:
     1. Fast log backup not implemented
+- Test:
+    1. `go test -run 2B`
+    2. `go test -run 2B -race` : May fail, seems like the lab RPC code has a race condition
 ### Lab 2C: Persistence
 - In Progress...
 ### Lab 2D: Log Compaction

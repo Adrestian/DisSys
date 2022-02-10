@@ -39,14 +39,14 @@ const (
 	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
 	FOLLOWER_HB_TIMEOUT_UPPER int = 900 // if no appendentries RPC has been received from leader or voted for other candidates
 
-	SEND_LOG_INTERVAL int = 100 // highest rate capped at 10/sec
-	TICKER_INTERVAL   int = 10
+	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
+	TICKER_INTERVAL   int = 5
 
 	ELECTION_TIMEOUT_LOWER     int = 300
 	ELECTION_TIMEOUT_UPPER     int = 800
 	ELECTION_CHECKING_INTERVAL int = 10
 
-	APPLY_LOG_INTERVAL int = 10
+	APPLY_LOG_INTERVAL int = 5
 )
 
 var (
@@ -931,7 +931,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// start ticker goroutine to start elections
 	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower
 	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)         // for state == Leader
-	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL/2) * time.Millisecond) // for checking commit, state == leader
+	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond)   // for checking commit, state == leader
 	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
 	go rf.ApplyLog(applyCh)
 	return rf
