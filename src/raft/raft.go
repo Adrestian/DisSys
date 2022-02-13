@@ -19,12 +19,14 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -39,7 +41,7 @@ const (
 	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
 	FOLLOWER_HB_TIMEOUT_UPPER int = 900 // if no appendentries RPC has been received from leader or voted for other candidates
 
-	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
+	SEND_LOG_INTERVAL int = 80 // highest rate capped at 10/sec
 	TICKER_INTERVAL   int = 5
 
 	ELECTION_TIMEOUT_LOWER     int = 300
@@ -47,6 +49,8 @@ const (
 	ELECTION_CHECKING_INTERVAL int = 10
 
 	APPLY_LOG_INTERVAL int = 5
+
+	NO_OP_CMD = "__NO_OP"
 )
 
 var (
@@ -127,6 +131,16 @@ type Raft struct {
 	currentVotes  int
 }
 
+// Generate a new No-op log entry from current term
+// Sync needed, Caller require {@code rf.mu}
+func (rf *Raft) NewNoOpLogEntry() *LogEntry {
+	var entry = LogEntry{
+		Term:    rf.currentTerm,
+		Command: NO_OP_CMD,
+	}
+	return &entry
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (term int, isLeader bool) {
@@ -141,6 +155,7 @@ func (rf *Raft) GetState() (term int, isLeader bool) {
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
+// Synchronization needed, Caller require {@code rf.mu}
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
@@ -151,13 +166,21 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(len(rf.log)) // encode the log length
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) == 0 { // bootstrap without any state?
 		return
 	}
 	// Your code here (2C).
@@ -173,6 +196,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var cTerm, vFor, logLength int
+
+	if err := d.Decode(&cTerm); err != nil {
+		log.Printf("[Error] %v Cannot Decode Current Term", rf.me)
+	}
+	if err := d.Decode(&vFor); err != nil {
+		log.Printf("[Error] %v Cannot Decode votedFor\n", rf.me)
+	}
+	if err := d.Decode(&logLength); err != nil {
+		log.Printf("[Error] %v Cannot Decode log length\n", rf.me)
+	}
+
+	var logEntry = make([]LogEntry, logLength)
+	rf.log = logEntry
+	rf.leaderInit()
 }
 
 //
@@ -225,6 +266,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if candidateLogOK && (rf.votedFor == NULL || rf.votedFor == candidateId) { // grant vote
 		reply.VoteGranted = true
 		rf.votedFor = candidateId
+		rf.persist()
 		//Printf("[Server %v] Voted YES For %v\n", rf.me, rf.votedFor)
 		resetFollowerTimer() // reset the follower timer
 		rf.state = Follower  // make sure
@@ -252,61 +294,6 @@ func isCandidateLogOk(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryI
 		return true
 	}
 	return false
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
-// Wrapper around rf.sendRequestVote()
-func (rf *Raft) SendRequestVote(server int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
-	if server == rf.me {
-		log.Fatalf("[Error: Server %v] Send RequestVote RPC to itself, wtf?\n", rf.me)
-	}
-	reply := &RequestVoteReply{}
-	ok := rf.sendRequestVote(server, args, reply)
-	return reply, ok
-}
-
-func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
-	var lastLogIndex = len(rf.log) - 1
-	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  rf.log[lastLogIndex].Term,
-	}
-	return args
 }
 
 // Reset the follower timer
@@ -345,146 +332,12 @@ func getElectionTimer() (time.Time, time.Duration) {
 	return ElectionStarted, ElectionTimeout
 }
 
-// TODO: Unfinished!
-// AppendEntries RPC handler
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// check RPC request's term
-	rf.ConvertToFollowerIfNeeded(args.Term)
-
-	// set the term in reply regardless
-	reply.Term = rf.currentTerm
-
-	// ignore outdated RPC
-	if args.Term < rf.currentTerm {
-		reply.Success = false
-		return
-	}
-	// valid RPC, reset the timer
-	resetFollowerTimer()
-	rf.state = Follower
-
-	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-	// or prevLogIndex points beyond the end of the log
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.Success = false
-		return
-	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Success = false
-		return
-	}
-
-	// 3 Cases
-	// log      [1 2 3 4 5 6]
-	// entries              [7, 8]
-	var thisLastLogIndex = len(rf.log) - 1
-	if args.PrevLogIndex == thisLastLogIndex {
-		Printf("[Server %v] Just append the log %+v\n", rf.me, args.Entries)
-		// just append
-		rf.log = append(rf.log, args.Entries...)
-		reply.Success = true // set reply.Success == True if folloer contained entry matching prevLogIndex and prevLogTerm
-	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) < len(rf.log) {
-		// check if match, otherwise clip the log,
-		// prevLogIndex == 3 in this case
-		// log      [1 2 3 4 5 6]
-		// entries        [4 5 6]
-		var argsPrevLogIndex = args.PrevLogIndex
-		var curr = argsPrevLogIndex + 1
-		var i = 0
-		for i < len(args.Entries) {
-			var logIdx = curr + i
-			if rf.log[logIdx].Term != args.Entries[i].Term {
-				rf.log = rf.log[:logIdx] // clip the log
-				rf.log = append(rf.log, args.Entries[i:]...)
-				break
-			}
-			i++
-		}
-		reply.Success = true // success
-	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) >= len(rf.log) {
-		// log      [1 2 3 4 5 6]
-		// entries          [5 6 7 8]
-		//                   c
-		var argsPrevLogIndex = args.PrevLogIndex
-		var curr = argsPrevLogIndex + 1
-
-		// Check inconsistency (discard the log if necessary)
-		var logConsistent = true
-		var i = 0
-		for i = 0; curr+i < len(rf.log); i++ {
-			var logIdx = curr + i
-			if rf.log[logIdx].Term != args.Entries[i].Term {
-				logConsistent = false
-				// Clip the log, append the remainder, done
-				rf.log = rf.log[:logIdx]
-				rf.log = append(rf.log, args.Entries[i:]...)
-				break
-			}
-		}
-		// append the remainder logs if no parts of the log is discarded
-		if logConsistent {
-			rf.log = append(rf.log, args.Entries[i:]...)
-		}
-
-		// TODO: Figure 2 AppendEntries RPC Receiver Implememtation $3, $4
-		// Starting from prevLogIndex
-		reply.Success = true // success
-	} else {
-		reply.Success = false
-		Printf("[Server %v] AppendEntries RPC handler: Should never happen: args: %+v\n", rf.me, *args)
-	}
-	// should all success at this point unless the args.PrevLogIndex is not in bound, <0 (Unchecked and unhandled)
-	// Printf("[Server %v] AppendEntries RPC Handler returns %v\n", rf.me, reply.Success)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-		rf.cond.Broadcast()
-	}
-	return
-}
-
 // Check if the index is in bound of the log
 func (rf *Raft) EntryInBound(index int) bool {
 	if index < 0 || index >= len(rf.log) {
 		return false
 	}
 	return true
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
-
-// Request AppendEntries RPC call,
-// this function does not acquire the lock inside raft instance
-func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
-	reply := &AppendEntriesReply{}
-	ok := rf.sendAppendEntries(server, args, reply)
-	return reply, ok
-}
-
-// Returns a (pointer to) prepared AppendEntriesArgs struct
-// this function does not hold lock while doing so
-func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
-	var prevLogIndex = rf.nextIndex[server] - 1
-	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PrevLogTerm:  rf.log[prevLogIndex].Term,
-		Entries:      rf.log[rf.nextIndex[server]:],
-		LeaderCommit: rf.commitIndex,
-	}
-	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
-		args.Entries = make([]LogEntry, 0)
-		if len(args.Entries) != 0 {
-			panic("not empty entry")
-		}
-	}
-	return args
 }
 
 //
@@ -511,6 +364,7 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	if isLeader {
 		var newEntry = LogEntry{Term: term, Command: command}
 		rf.log = append(rf.log, newEntry)
+		rf.persist()
 	}
 	// Your code here (2B).
 
@@ -570,6 +424,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.votedFor = rf.me
 	rf.majorityVotes = (len(rf.peers) / 2) + 1
 	rf.currentVotes = 1 // vote for itself
+	rf.persist()        // save state to disk
 	resetElectionTimer()
 }
 
@@ -605,6 +460,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	rf.majorityVotes = 9999999
 	rf.currentVotes = -9999999
 	rf.state = Follower
+	rf.persist()
 }
 
 // Check if newTerm is higher the current term
@@ -805,7 +661,6 @@ func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, r
 		rf.matchIndex[server] = args.PrevLogIndex + entryLen
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
 	}
-	return
 }
 
 // Kick {@code (rf *Raft) ApplyLog()} periodically
@@ -827,7 +682,6 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 		for !(rf.commitIndex > rf.lastApplied) {
 			rf.cond.Wait()
 		}
-
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			rf.applyLogEntry(rf.lastApplied, applyCh)
@@ -870,11 +724,22 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.me = me
 	rf.cond = sync.NewCond(&rf.mu)
 
-	// Your initialization code here (2A, 2B, 2C).
-	rf.becomeFollower(0) // on boot init to follower
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
-	// To Persistent Storage
-	rf.log = append(rf.log, LogEntry{Term: 0, Command: "Place Holder"})
+	if rf.currentTerm == 0 && len(rf.log) == 0 { // not starting from crash
+		// To Persistent Storage
+		rf.log = append(rf.log, *rf.NewNoOpLogEntry())
+
+		// Your initialization code here (2A, 2B, 2C).
+		rf.becomeFollower(0) // on boot init to follower
+
+		if Debug {
+			if rf.log[0].Term != 0 || rf.log[0].Command != NO_OP_CMD {
+				panic("rf.NewNoOpLogEntry() Failed")
+			}
+		}
+	}
 
 	// Volatile State on all servers
 	rf.commitIndex = 0
@@ -885,9 +750,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.matchIndex = make([]int, len(peers)) // (should init to 0)
 
 	resetFollowerTimer()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.persist()
 
 	// start ticker goroutine to start elections
 	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower
