@@ -27,10 +27,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.ConvertToFollowerIfNeeded(args.Term)
 
 	// set the term in reply regardless
-	reply.Term = rf.currentTerm
+	// reply.Term = rf.currentTerm
 
 	// ignore outdated RPC
 	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
@@ -43,10 +44,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 	// or prevLogIndex points beyond the end of the log
 	if args.PrevLogIndex >= len(rf.log) {
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
@@ -60,6 +63,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// just append
 		rf.log = append(rf.log, args.Entries...)
 		rf.persist()
+
+		reply.Term = rf.currentTerm
 		reply.Success = true // set reply.Success == True if folloer contained entry matching prevLogIndex and prevLogTerm
 	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) < len(rf.log) {
 		// check if match, otherwise clip the log,
@@ -78,6 +83,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			i++
 		}
+		rf.persist()
+
+		reply.Term = rf.currentTerm
 		reply.Success = true // success
 	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) >= len(rf.log) {
 		// log      [1 2 3 4 5 6]
@@ -106,6 +114,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist()
 		// TODO: Figure 2 AppendEntries RPC Receiver Implememtation $3, $4
 		// Starting from prevLogIndex
+		reply.Term = rf.currentTerm
 		reply.Success = true // success
 	} else {
 		reply.Success = false

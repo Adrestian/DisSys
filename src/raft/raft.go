@@ -18,14 +18,13 @@ package raft
 //
 
 import (
-	//	"bytes"
 	"bytes"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.824/labgob"
 	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -34,14 +33,14 @@ const (
 	Leader    int = 32
 	Candidate int = 64
 	Follower  int = 128
-	NULL      int = -1
+	NULL      int = -1 // Seems like init to 0 is a bad idea
 )
 
 const (
 	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
 	FOLLOWER_HB_TIMEOUT_UPPER int = 900 // if no appendentries RPC has been received from leader or voted for other candidates
 
-	SEND_LOG_INTERVAL int = 80 // highest rate capped at 10/sec
+	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
 	TICKER_INTERVAL   int = 5
 
 	ELECTION_TIMEOUT_LOWER     int = 300
@@ -180,7 +179,10 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if len(data) == 0 { // bootstrap without any state?
+	if len(data) == 0 { // nothing to read
+		if Debug {
+			log.Printf("[Server %v] Read from disk, nothing to read\n", rf.me)
+		}
 		return
 	}
 	// Your code here (2C).
@@ -202,13 +204,13 @@ func (rf *Raft) readPersist(data []byte) {
 	var cTerm, vFor, logLength int
 
 	if err := d.Decode(&cTerm); err != nil {
-		log.Printf("[Error] %v Cannot Decode Current Term", rf.me)
+		log.Fatalf("[Error] %v Cannot Decode Current Term", rf.me)
 	}
 	if err := d.Decode(&vFor); err != nil {
-		log.Printf("[Error] %v Cannot Decode votedFor\n", rf.me)
+		log.Fatalf("[Error] %v Cannot Decode votedFor\n", rf.me)
 	}
 	if err := d.Decode(&logLength); err != nil {
-		log.Printf("[Error] %v Cannot Decode log length\n", rf.me)
+		log.Fatalf("[Error] %v Cannot Decode log length\n", rf.me)
 	}
 
 	var logEntry = make([]LogEntry, logLength)
@@ -264,12 +266,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	var candidateLogOK = isCandidateLogOk(lastEntryIndex, lastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm)
 
 	if candidateLogOK && (rf.votedFor == NULL || rf.votedFor == candidateId) { // grant vote
-		reply.VoteGranted = true
+		rf.state = Follower // make sure
 		rf.votedFor = candidateId
 		rf.persist()
 		//Printf("[Server %v] Voted YES For %v\n", rf.me, rf.votedFor)
 		resetFollowerTimer() // reset the follower timer
-		rf.state = Follower  // make sure
+		reply.VoteGranted = true
 		return
 	}
 	// otherwise vote no
@@ -317,6 +319,12 @@ func getDeadline() time.Time {
 	return LastReceived.Add(FollowerTimeout)
 }
 
+func getElectionDeadline() time.Time {
+	ElectionStartedMu.Lock()
+	defer ElectionStartedMu.Unlock()
+	return ElectionStarted.Add(ElectionTimeout)
+}
+
 // Reset the election timer
 func resetElectionTimer() {
 	ElectionStartedMu.Lock()
@@ -325,11 +333,12 @@ func resetElectionTimer() {
 	ElectionStarted = time.Now()
 }
 
-// Access wrapper function
-func getElectionTimer() (time.Time, time.Duration) {
+// Return when the election started, and when the election expires
+func getElectionTimer() (time.Time, time.Time) {
 	ElectionStartedMu.Lock()
 	defer ElectionStartedMu.Unlock()
-	return ElectionStarted, ElectionTimeout
+	var ddl = ElectionStarted.Add(ElectionTimeout)
+	return ElectionStarted, ddl
 }
 
 // Check if the index is in bound of the log
@@ -457,10 +466,10 @@ func (rf *Raft) leaderInit() {
 func (rf *Raft) becomeFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = NULL
-	rf.majorityVotes = 9999999
-	rf.currentVotes = -9999999
+	rf.majorityVotes = math.MaxInt
+	rf.currentVotes = math.MinInt
 	rf.state = Follower
-	rf.persist()
+	rf.persist() // write to disk
 }
 
 // Check if newTerm is higher the current term
@@ -477,9 +486,7 @@ func (rf *Raft) ConvertToFollowerIfNeeded(newTerm int) bool {
 func (rf *Raft) SendLog(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state == Leader {
-			// TODO: Send Follower log
-			// Code here
+		if rf.state == Leader { // Send Follower log
 			for server := range rf.peers {
 				if server == rf.me {
 					continue
@@ -490,16 +497,19 @@ func (rf *Raft) SendLog(interval time.Duration) {
 				go func(server int, args *AppendEntriesArgs) {
 					var reply, ok = rf.SendAppendEntries(server, args)
 					var sentInTerm = args.Term
+
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
-					if ok && rf.ConvertToFollowerIfNeeded(reply.Term) {
-						return
-					}
 
 					if !ok || rf.state != Leader || sentInTerm != reply.Term || rf.currentTerm != args.Term {
 						return
 					}
+
+					if rf.ConvertToFollowerIfNeeded(reply.Term) {
+						return
+					}
 					rf.AppendEntriesReplyHandler(server, args, reply)
+
 				}(server, args)
 			}
 		}
@@ -515,56 +525,49 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 		if rf.state != Candidate {
 			rf.mu.Unlock()
 			return false
-		} else if rf.state == Candidate {
-			rf.becomeCandidate() // increment the term, reset the timer
+		}
+		rf.becomeCandidate() // increment the term, reset the timer
 
-			// send RequestVotes RPC to every peer
-			for i := range rf.peers {
-				if i == rf.me {
-					continue // don't send to itself
-				}
-
-				var requestVoteArgs = rf.NewRequestVoteArgs()
-
-				go func(server int, args *RequestVoteArgs) {
-					reply, ok := rf.SendRequestVote(server, args)
-					var sentInTerm = args.Term
-
-					rf.mu.Lock() // lock acquired here
-					defer rf.mu.Unlock()
-					// Check for current Term, avoid outdated RPC reply
-					if ok && rf.ConvertToFollowerIfNeeded(reply.Term) {
-						return
-					}
-
-					if sentInTerm != reply.Term || args.Term != rf.currentTerm {
-						return
-					}
-
-					if ok && reply.VoteGranted {
-						rf.currentVotes++
-					} else if ok {
-						// vote not granted
-						//Printf("[Candidate %v] Vote not granted from %v\n", rf.me, i)
-					} else {
-						// RPC failed
-						//Printf("[Candidate %v] RPC to peer %v failed\n", rf.me, i)
-					}
-
-					if rf.currentVotes == rf.majorityVotes {
-						Printf("[Server %v] Received majority votes, become leader, term: %v\n", rf.me, rf.currentTerm)
-						rf.becomeLeader()
-						// immediately send one round of heartbeat to followers
-						rf.sendHB()
-					}
-				}(i, requestVoteArgs)
+		// send RequestVotes RPC to every peer
+		for i := range rf.peers {
+			if i == rf.me {
+				continue // don't send to itself
 			}
 
+			var requestVoteArgs = rf.NewRequestVoteArgs()
+
+			go func(server int, args *RequestVoteArgs) {
+				reply, ok := rf.SendRequestVote(server, args)
+				var sentInTerm = args.Term
+
+				rf.mu.Lock() // lock acquired here
+				defer rf.mu.Unlock()
+				// Check for current Term, avoid outdated RPC reply
+				if !ok || rf.ConvertToFollowerIfNeeded(reply.Term) ||
+					sentInTerm != reply.Term || args.Term != rf.currentTerm ||
+					rf.state != Candidate {
+					// !ok -> RPC failed
+					// sentInTerm != reply.Term || args.Term != rf.currentTerm -> OUTDATED RPC
+					return
+				}
+
+				if reply.VoteGranted {
+					rf.currentVotes++
+				}
+
+				if rf.currentVotes == rf.majorityVotes {
+					Printf("[Server %v] Received majority votes, become leader, term: %v\n", rf.me, rf.currentTerm)
+					rf.becomeLeader()
+					// immediately send one round of heartbeat to followers
+					rf.sendHB()
+				}
+			}(i, requestVoteArgs)
 		}
+
 		rf.mu.Unlock()
+		// ###### This section of code is kind of shit ############
 		// wait until Election Timeout
-		var electionStarted, electionTimeout = getElectionTimer()
-		var electionDeadline = electionStarted.Add(electionTimeout)
+		var electionStarted, electionDeadline = getElectionTimer()
 		var now = time.Now()
 		for inTimeSpan(electionStarted, electionDeadline, now) {
 			time.Sleep(checkInterval)
@@ -580,6 +583,8 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 			rf.mu.Unlock() // exit 3
 			now = time.Now()
 		} // on timeout, go to the next iteration, increment term, send RPCs, etc
+
+		// ##########################################################
 	}
 	return false
 }
@@ -639,13 +644,11 @@ func (rf *Raft) sendHB() {
 			var sentInTerm = args.Term
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if ok && rf.ConvertToFollowerIfNeeded(reply.Term) {
+			if !ok || rf.ConvertToFollowerIfNeeded(reply.Term) || rf.state != Leader ||
+				sentInTerm != reply.Term || rf.currentTerm != args.Term {
+				// RPC failed or outdated
 				return
 			}
-
-			if !ok || rf.state != Leader || sentInTerm != reply.Term || rf.currentTerm != args.Term {
-				return
-			} // RPC failed or outdated
 
 			rf.AppendEntriesReplyHandler(server, args, reply)
 
@@ -727,7 +730,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	if rf.currentTerm == 0 && len(rf.log) == 0 { // not starting from crash
+	if rf.currentTerm == 0 && len(rf.log) == 0 && rf.votedFor == 0 { // Go's default init, not starting from crash
 		// To Persistent Storage
 		rf.log = append(rf.log, *rf.NewNoOpLogEntry())
 
@@ -750,7 +753,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.matchIndex = make([]int, len(peers)) // (should init to 0)
 
 	resetFollowerTimer()
-	rf.persist()
 
 	// start ticker goroutine to start elections
 	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower
