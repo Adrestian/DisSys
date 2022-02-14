@@ -37,8 +37,8 @@ const (
 )
 
 const (
-	FOLLOWER_HB_TIMEOUT_LOWER int = 250 // Lower and Upper bound for the timeout where the follower becomes candidate
-	FOLLOWER_HB_TIMEOUT_UPPER int = 900 // if no appendentries RPC has been received from leader or voted for other candidates
+	FOLLOWER_HB_TIMEOUT_LOWER int = 300  // Lower and Upper bound for the timeout where the follower becomes candidate
+	FOLLOWER_HB_TIMEOUT_UPPER int = 1500 // if no appendentries RPC has been received from leader or voted for other candidates
 
 	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
 	TICKER_INTERVAL   int = 5
@@ -171,15 +171,16 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
+	//Printf("[Server %v] fsync\n", rf.me)
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+// Return true if raft state is restored from ata
+// Return false if the state is untouched
+func (rf *Raft) readPersist(data []byte) bool {
 	if len(data) == 0 { // nothing to read
-		if Debug {
-			log.Printf("[Server %v] Read from disk, nothing to read\n", rf.me)
-		}
-		return
+		Printf("[Server %v] Nothing to read\n", rf.me)
+		return false
 	}
 	/*// Your code here (2C).
 	// Example:
@@ -198,21 +199,28 @@ func (rf *Raft) readPersist(data []byte) {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var cTerm, vFor, logLength int
+	var currentTerm, votedFor, logLength int
 
-	if err := d.Decode(&cTerm); err != nil {
-		log.Fatalf("[Error] %v Cannot Decode Current Term", rf.me)
+	if err := d.Decode(&currentTerm); err != nil {
+		log.Fatalf("[Error] Server %v Cannot Decode Current Term", rf.me)
 	}
-	if err := d.Decode(&vFor); err != nil {
-		log.Fatalf("[Error] %v Cannot Decode votedFor\n", rf.me)
+	if err := d.Decode(&votedFor); err != nil {
+		log.Fatalf("[Error] Server %v Cannot Decode votedFor\n", rf.me)
 	}
 	if err := d.Decode(&logLength); err != nil {
-		log.Fatalf("[Error] %v Cannot Decode log length\n", rf.me)
+		log.Fatalf("[Error] Server %v Cannot Decode log length\n", rf.me)
 	}
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
 
 	var logEntry = make([]LogEntry, logLength)
+	if err := d.Decode(&logEntry); err != nil {
+		log.Fatalf("[Error] Server %v Cannot Decode log\n", rf.me)
+	}
 	rf.log = logEntry
-	rf.leaderInit()
+	//rf.leaderInit()
+	Printf("[Server %v] Read From Disk: Log %+v\n", rf.me, rf.log)
+	return true
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -244,10 +252,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.ConvertToFollowerIfNeeded(args.Term) // check the term in request args
 
 	// reply with this raft instance's term regardless
-	reply.Term = rf.currentTerm
+	// reply.Term = rf.currentTerm
 	// Candidate term is too low, vote no immediately
 	var candidateTerm = args.Term
 	if candidateTerm < rf.currentTerm {
+		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
@@ -262,16 +271,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if candidateLogOK && (rf.votedFor == NULL || rf.votedFor == candidateId) { // grant vote
 		rf.state = Follower // make sure
+		rf.currentTerm = candidateTerm
 		rf.votedFor = candidateId
 		rf.persist()
 		//Printf("[Server %v] Voted YES For %v\n", rf.me, rf.votedFor)
 		resetFollowerTimer() // reset the follower timer
 		reply.VoteGranted = true
+		reply.Term = rf.currentTerm
 		return
 	}
 	// otherwise vote no
 	//Printf("[Server %v] Voted NO For %v\n", rf.me, args.CandidateId)
 	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 }
 
 // Check if the candidate log is ok
@@ -301,17 +313,11 @@ func resetFollowerTimer() {
 	FollowerTimeout = GetRandomTimeout(FOLLOWER_HB_TIMEOUT_LOWER, FOLLOWER_HB_TIMEOUT_UPPER, time.Millisecond)
 }
 
-// Access wrapper function
-func getLastReceived() (time.Time, time.Duration) {
+// Accessor function for LastReceived and ddl for timeout
+func getLastReceived() (time.Time, time.Time) {
 	LastReceivedMu.Lock()
 	defer LastReceivedMu.Unlock()
-	return LastReceived, FollowerTimeout
-}
-
-func getDeadline() time.Time {
-	LastReceivedMu.Lock()
-	defer LastReceivedMu.Unlock()
-	return LastReceived.Add(FollowerTimeout)
+	return LastReceived, LastReceived.Add(FollowerTimeout)
 }
 
 func getElectionDeadline() time.Time {
@@ -366,8 +372,9 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 	isLeader = rf.state == Leader
 
 	if isLeader {
-		var newEntry = LogEntry{Term: term, Command: command}
+		var newEntry = LogEntry{Term: rf.currentTerm, Command: command}
 		rf.log = append(rf.log, newEntry)
+		Printf("[Leader %v] Start agree with %+v\n", rf.me, newEntry)
 		rf.persist()
 	}
 	// Your code here (2B).
@@ -402,8 +409,7 @@ func (rf *Raft) ticker(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.state == Follower {
-			var lastReceived, _ = getLastReceived()
-			var deadline = getDeadline()
+			var lastReceived, deadline = getLastReceived()
 			var now = time.Now()
 			if !inTimeSpan(lastReceived, deadline, now) {
 				// Note:
@@ -462,7 +468,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 	rf.currentTerm = newTerm
 	rf.votedFor = NULL
 	rf.majorityVotes = math.MaxInt
-	rf.currentVotes = math.MinInt
+	rf.currentVotes = -999999
 	rf.state = Follower
 	rf.persist() // write to disk
 }
@@ -488,7 +494,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 				}
 
 				var args = rf.NewAppendEntriesArgs(server, false)
-				Printf("[Leader %v] with term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
+				// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
 				go func(server int, args *AppendEntriesArgs) {
 					var reply, ok = rf.SendAppendEntries(server, args)
 					var sentInTerm = args.Term
@@ -596,6 +602,7 @@ func (rf *Raft) LeaderCommit(interval time.Duration) {
 func (rf *Raft) checkCommit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	if rf.state != Leader {
 		return
 	} // Only leader check and set commitIndex
@@ -617,6 +624,7 @@ func (rf *Raft) checkCommit() {
 		}
 		if count >= majority {
 			rf.commitIndex = N
+			Printf("[Leader %v] Leader Commit Set to %v\n", rf.me, N)
 			rf.matchIndex[rf.me] = N
 			rf.cond.Broadcast()
 			break
@@ -640,7 +648,7 @@ func (rf *Raft) sendHB() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if !ok || rf.ConvertToFollowerIfNeeded(reply.Term) || rf.state != Leader ||
-				sentInTerm != reply.Term || rf.currentTerm != args.Term {
+				sentInTerm != reply.Term || rf.currentTerm != sentInTerm {
 				// RPC failed or outdated
 				return
 			}
@@ -701,8 +709,14 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 
 func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
 	var applyMsg = rf.NewApplyMsg(applyIndex)
+	if Debug {
+		if rf.state == Leader {
+			Printf("[Leader %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
+		} else {
+			Printf("[Follower %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
+		}
+	}
 	applyCh <- *applyMsg
-
 }
 
 func (rf *Raft) NewApplyMsg(applyIndex int) *ApplyMsg {
@@ -733,7 +747,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.cond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+
+	if rf.readPersist(persister.ReadRaftState()) {
+		// just recovered from crash
+		rf.state = Follower
+	}
 
 	if rf.currentTerm == 0 && len(rf.log) == 0 && rf.votedFor == 0 { // Go's default init, not starting from crash
 		// To Persistent Storage

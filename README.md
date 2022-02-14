@@ -20,10 +20,12 @@
 ### Lab 2B: Log
 - *Finished*
 - Test:
-    1. `go test -run 2B` OR
-    2. `go test -run 2B -race` : Seems like `labrpc` has a race condition bug?
+    1. `go test -run 2B -race` : Seems like `labrpc` has a race condition bug?
 ### Lab 2C: Persistence
-- In Progress...
+- *Finished*
+- Test:
+    1. `go test -run 2C -race`
+- Note: the second test case seems to depend on timing
 ### Lab 2D: Log Compaction
 - Idle
 

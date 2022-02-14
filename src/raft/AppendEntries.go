@@ -17,7 +17,6 @@ type AppendEntriesReply struct {
 	ConflictLen   int  // length of the follower's log
 }
 
-// TODO: Unfinished!
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -58,7 +57,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Case 1: leader doesn't have follower's term
 		// F: [4 5 5]
 		// L: [4 6 6 6]
-		//
 		// Case 2: leader does have follower's term
 		// F: [4 4 4]
 		// L: [4 6 6 6]
@@ -78,7 +76,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// entries              [7, 8]
 	var thisLastLogIndex = len(rf.log) - 1
 	if args.PrevLogIndex == thisLastLogIndex {
-		Printf("[Server %v] Just append the log %+v\n", rf.me, args.Entries)
+		if Debug && len(args.Entries) != 0 {
+			Printf("[Server %v] Just append the log %+v\n", rf.me, args.Entries)
+		}
 		// just append
 		rf.log = append(rf.log, args.Entries...)
 		rf.persist()
@@ -137,6 +137,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true // success
 	} else {
 		reply.Success = false
+		reply.Term = rf.currentTerm
 		Printf("[Server %v] AppendEntries RPC handler: Should never happen: args: %+v\n", rf.me, *args)
 	}
 	// should all success at this point unless the args.PrevLogIndex is not in bound, <0 (Unchecked and unhandled)
@@ -145,6 +146,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		rf.cond.Broadcast()
 	}
+	Printf("[Server %v]: log %+v\n", rf.me, rf.log)
+	Printf("[Server %v]: Commit Index: %v\n", rf.me, rf.commitIndex)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
