@@ -23,7 +23,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// check RPC request's term
+	// check RPC request's term, if higher, convert to follower
 	rf.ConvertToFollowerIfNeeded(args.Term)
 
 	// set the term in reply regardless
@@ -35,9 +35,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	// valid RPC, reset the timer
-	// This will actually cancel the election
-	// if this raft instance is in follower state
+	// otherwise, it's a valid RPC, reset the timer
+	// This will actually cancel the election if this raft instance is in follower state
 	resetFollowerTimer()
 	rf.state = Follower
 
@@ -46,11 +45,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		// Case 3: follower doesn't have the log
+		// Follower : [4]
+		// Leader   : [4 6 6 6]
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = -1
+		reply.ConflictLen = len(rf.log)
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Handle case 1 and 2
+		// Case 1: leader doesn't have follower's term
+		// F: [4 5 5]
+		// L: [4 6 6 6]
+		//
+		// Case 2: leader does have follower's term
+		// F: [4 4 4]
+		// L: [4 6 6 6]
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		var logIndex = args.PrevLogIndex
+		var entryTerm = rf.log[logIndex].Term
+		var conflictingIndex = rf.getConflictingIndex(logIndex, entryTerm)
+		reply.ConflictLen = len(rf.log)
+		reply.ConflictTerm = entryTerm
+		reply.ConflictIndex = conflictingIndex
 		return
 	}
 

@@ -150,12 +150,10 @@ func (rf *Raft) GetState() (term int, isLeader bool) {
 	return
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 // Synchronization needed, Caller require {@code rf.mu}
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -175,9 +173,7 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	if len(data) == 0 { // nothing to read
 		if Debug {
@@ -185,7 +181,7 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		return
 	}
-	// Your code here (2C).
+	/*// Your code here (2C).
 	// Example:
 	// r := bytes.NewBuffer(data)
 	// d := labgob.NewDecoder(r)
@@ -198,6 +194,7 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	*/
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
@@ -218,10 +215,8 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.leaderInit()
 }
 
-//
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
-//
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
@@ -657,13 +652,23 @@ func (rf *Raft) sendHB() {
 }
 
 func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	if !reply.Success {
-		rf.nextIndex[server] = max(rf.nextIndex[server]-1, rf.matchIndex[server], 1)
-	} else if reply.Success {
+	if reply.Success {
 		var entryLen = len(args.Entries)
 		rf.matchIndex[server] = args.PrevLogIndex + entryLen
 		rf.nextIndex[server] = rf.matchIndex[server] + 1
+		return
 	}
+	// Follower reject the log because it doesn't have that entry
+	if followerMissingLog(reply) {
+		rf.nextIndex[server] = reply.ConflictLen
+		return
+	}
+	// Follower reject the log because of comflict
+	rf.nextIndex[server] = reply.ConflictIndex
+}
+
+func followerMissingLog(reply *AppendEntriesReply) bool {
+	return reply.ConflictTerm == -1 && reply.ConflictIndex == -1
 }
 
 // Kick {@code (rf *Raft) ApplyLog()} periodically
@@ -761,4 +766,14 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
 	go rf.ApplyLog(applyCh)
 	return rf
+}
+
+// Compute the index of first entry with conflicting term(xTerm)
+func (rf *Raft) getConflictingIndex(startingIndex, xTerm int) int {
+	var i = startingIndex - 1
+	for i >= 1 && rf.log[i].Term >= xTerm {
+		i--
+	}
+	i++ // make sure it doesn't fall off the bound
+	return i
 }

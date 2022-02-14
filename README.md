@@ -18,8 +18,7 @@
 
 
 ### Lab 2B: Log
-- *Finished*, except:
-    1. Fast log backup not implemented
+- *Finished*
 - Test:
     1. `go test -run 2B` OR
     2. `go test -run 2B -race` : Seems like `labrpc` has a race condition bug?
