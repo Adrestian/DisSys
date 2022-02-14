@@ -52,16 +52,7 @@ const (
 	NO_OP_CMD = "__NO_OP"
 )
 
-var (
-	LastReceivedMu  sync.Mutex
-	LastReceived    time.Time     // AppendEntries/RequestVote RPC may reset the timer
-	FollowerTimeout time.Duration // on timeout become candidate
-	// between FOLLOWER_HB_TIMEOUT_LOWER and FOLLOWER_HB_TIMEOUT_UPPER
-
-	ElectionStartedMu sync.Mutex
-	ElectionStarted   time.Time
-	ElectionTimeout   time.Duration // on timeout, start a new term, transition to candidate
-)
+var ()
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -95,6 +86,15 @@ type LogEntry struct {
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	LastReceivedMu  sync.Mutex
+	LastReceived    time.Time     // AppendEntries/RequestVote RPC may reset the timer
+	FollowerTimeout time.Duration // on timeout become candidate
+	// between FOLLOWER_HB_TIMEOUT_LOWER and FOLLOWER_HB_TIMEOUT_UPPER
+
+	ElectionStartedMu sync.Mutex
+	ElectionStarted   time.Time
+	ElectionTimeout   time.Duration // on timeout, start a new term, transition to candidate
+
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
 	cond      *sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -275,7 +275,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = candidateId
 		rf.persist()
 		//Printf("[Server %v] Voted YES For %v\n", rf.me, rf.votedFor)
-		resetFollowerTimer() // reset the follower timer
+		rf.resetFollowerTimer() // reset the follower timer
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		return
@@ -306,40 +306,42 @@ func isCandidateLogOk(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryI
 }
 
 // Reset the follower timer
-func resetFollowerTimer() {
-	LastReceivedMu.Lock()
-	defer LastReceivedMu.Unlock()
-	LastReceived = time.Now()
-	FollowerTimeout = GetRandomTimeout(FOLLOWER_TIMEOUT_LOWER, FOLLOWER_TIMEOUT_UPPER, time.Millisecond)
+func (rf *Raft) resetFollowerTimer() {
+	rf.LastReceivedMu.Lock()
+	defer rf.LastReceivedMu.Unlock()
+	rf.LastReceived = time.Now()
+	rf.FollowerTimeout = GetRandomTimeout(FOLLOWER_TIMEOUT_LOWER, FOLLOWER_TIMEOUT_UPPER, time.Millisecond)
+	Printf("[Reset Follower Time out]: %v\n", rf.FollowerTimeout)
 }
 
 // Accessor function for LastReceived and ddl for timeout
-func getLastReceived() (time.Time, time.Time) {
-	LastReceivedMu.Lock()
-	defer LastReceivedMu.Unlock()
-	return LastReceived, LastReceived.Add(FollowerTimeout)
+func (rf *Raft) getLastReceived() (time.Time, time.Time) {
+	rf.LastReceivedMu.Lock()
+	defer rf.LastReceivedMu.Unlock()
+	return rf.LastReceived, rf.LastReceived.Add(rf.FollowerTimeout)
 }
 
-func getElectionDeadline() time.Time {
-	ElectionStartedMu.Lock()
-	defer ElectionStartedMu.Unlock()
-	return ElectionStarted.Add(ElectionTimeout)
+func (rf *Raft) getElectionDeadline() time.Time {
+	rf.ElectionStartedMu.Lock()
+	defer rf.ElectionStartedMu.Unlock()
+	return rf.ElectionStarted.Add(rf.ElectionTimeout)
 }
 
 // Reset the election timer
-func resetElectionTimer() {
-	ElectionStartedMu.Lock()
-	defer ElectionStartedMu.Unlock()
-	ElectionTimeout = GetRandomTimeout(ELECTION_TIMEOUT_LOWER, ELECTION_TIMEOUT_UPPER, time.Millisecond)
-	ElectionStarted = time.Now()
+func (rf *Raft) resetElectionTimer() {
+	rf.ElectionStartedMu.Lock()
+	defer rf.ElectionStartedMu.Unlock()
+	rf.ElectionTimeout = GetRandomTimeout(ELECTION_TIMEOUT_LOWER, ELECTION_TIMEOUT_UPPER, time.Millisecond)
+	rf.ElectionStarted = time.Now()
+	Printf("ElectionStarted: %v, ElectionTimeout: %v\n", rf.ElectionStarted, rf.ElectionTimeout)
 }
 
 // Return when the election started, and when the election expires
-func getElectionTimer() (time.Time, time.Time) {
-	ElectionStartedMu.Lock()
-	defer ElectionStartedMu.Unlock()
-	var ddl = ElectionStarted.Add(ElectionTimeout)
-	return ElectionStarted, ddl
+func (rf *Raft) getElectionTimer() (time.Time, time.Time) {
+	rf.ElectionStartedMu.Lock()
+	defer rf.ElectionStartedMu.Unlock()
+	var ddl = rf.ElectionStarted.Add(rf.ElectionTimeout)
+	return rf.ElectionStarted, ddl
 }
 
 // Check if the index is in bound of the log
@@ -409,7 +411,7 @@ func (rf *Raft) ticker(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.state == Follower {
-			var lastReceived, deadline = getLastReceived()
+			var lastReceived, deadline = rf.getLastReceived()
 			var now = time.Now()
 			if !inTimeSpan(lastReceived, deadline, now) {
 				// Note:
@@ -435,7 +437,7 @@ func (rf *Raft) becomeCandidate() {
 	rf.majorityVotes = (len(rf.peers) / 2) + 1
 	rf.currentVotes = 1 // vote for itself
 	rf.persist()        // save state to disk
-	resetElectionTimer()
+	rf.resetElectionTimer()
 }
 
 // Set the current raft instance to leader, init everything necessary
@@ -568,7 +570,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 		rf.mu.Unlock()
 		// ###### This section of code is kind of shit ############
 		// wait until Election Timeout
-		var electionStarted, electionDeadline = getElectionTimer()
+		var electionStarted, electionDeadline = rf.getElectionTimer()
 		var now = time.Now()
 		for inTimeSpan(electionStarted, electionDeadline, now) {
 			time.Sleep(checkInterval)
@@ -776,7 +778,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.nextIndex = make([]int, len(peers))  // No need to init when the state is follower
 	rf.matchIndex = make([]int, len(peers)) // (should init to 0)
 
-	resetFollowerTimer()
+	rf.resetFollowerTimer()
 
 	// start ticker goroutine to start elections
 	go rf.ticker(time.Duration(TICKER_INTERVAL) * time.Millisecond)            // for state == Follower

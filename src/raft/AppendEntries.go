@@ -36,7 +36,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// otherwise, it's a valid RPC, reset the timer
 	// This will actually cancel the election if this raft instance is in follower state
-	resetFollowerTimer()
+	rf.resetFollowerTimer()
 	rf.state = Follower
 
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
