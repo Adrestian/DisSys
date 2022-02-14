@@ -37,15 +37,15 @@ const (
 )
 
 const (
-	FOLLOWER_HB_TIMEOUT_LOWER int = 300  // Lower and Upper bound for the timeout where the follower becomes candidate
-	FOLLOWER_HB_TIMEOUT_UPPER int = 1500 // if no appendentries RPC has been received from leader or voted for other candidates
+	FOLLOWER_TIMEOUT_LOWER int = 300  // Lower and Upper bound for the timeout where the follower becomes candidate
+	FOLLOWER_TIMEOUT_UPPER int = 1200 // if no appendentries RPC has been received from leader or voted for other candidates
 
 	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
 	TICKER_INTERVAL   int = 5
 
 	ELECTION_TIMEOUT_LOWER     int = 300
-	ELECTION_TIMEOUT_UPPER     int = 800
-	ELECTION_CHECKING_INTERVAL int = 10
+	ELECTION_TIMEOUT_UPPER     int = 1000
+	ELECTION_CHECKING_INTERVAL int = 5
 
 	APPLY_LOG_INTERVAL int = 5
 
@@ -310,7 +310,7 @@ func resetFollowerTimer() {
 	LastReceivedMu.Lock()
 	defer LastReceivedMu.Unlock()
 	LastReceived = time.Now()
-	FollowerTimeout = GetRandomTimeout(FOLLOWER_HB_TIMEOUT_LOWER, FOLLOWER_HB_TIMEOUT_UPPER, time.Millisecond)
+	FollowerTimeout = GetRandomTimeout(FOLLOWER_TIMEOUT_LOWER, FOLLOWER_TIMEOUT_UPPER, time.Millisecond)
 }
 
 // Accessor function for LastReceived and ddl for timeout
@@ -584,6 +584,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 			rf.mu.Unlock() // exit 3
 			now = time.Now()
 		} // on timeout, go to the next iteration, increment term, send RPCs, etc
+		Printf("[Server %v] received %v votes\n", rf.me, rf.currentVotes)
 
 		// ##########################################################
 	}
