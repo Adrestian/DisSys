@@ -34,9 +34,7 @@ const (
 	Candidate int = 64
 	Follower  int = 128
 	NULL      int = -1 // Seems like init to 0 is a bad idea
-)
 
-const (
 	FOLLOWER_TIMEOUT_LOWER int = 300  // Lower and Upper bound for the timeout where the follower becomes candidate
 	FOLLOWER_TIMEOUT_UPPER int = 1200 // if no appendentries RPC has been received from leader or voted for other candidates
 
@@ -51,8 +49,6 @@ const (
 
 	NO_OP_CMD = "__NO_OP"
 )
-
-var ()
 
 //
 // as each Raft peer becomes aware that successive log entries are
