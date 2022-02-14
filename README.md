@@ -15,17 +15,14 @@
 - Test:
     1. `cd src/raft`
     2. `go test -run 2A -race`
-
-
 ### Lab 2B: Log
 - *Finished*
 - Test:
-    1. `go test -run 2B -race` : Seems like `labrpc` has a race condition bug?
+    1. `go test -run 2B -race` 
 ### Lab 2C: Persistence
 - *Finished*
 - Test:
     1. `go test -run 2C -race`
-- Note: the second test case seems to depend on timing
 ### Lab 2D: Log Compaction
 - Idle
 
