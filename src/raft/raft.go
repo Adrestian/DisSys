@@ -753,6 +753,7 @@ func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
 		}
 	}
 	applyCh <- *applyMsg
+	Printf("[Server %v] applied Ops: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
 }
 
 func (rf *Raft) NewApplyMsg(applyIndex int) *ApplyMsg {

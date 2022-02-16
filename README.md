@@ -24,7 +24,7 @@
 - Test:
     1. `go test -run 2C -race`
 ### Lab 2D: Log Compaction
-- Idle
+- *In Progress...*
 
 ### Additional Resources
 - [Raft Visualized](http://thesecretlivesofdata.com/raft/)
