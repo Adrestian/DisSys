@@ -23,7 +23,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	// check RPC request's term, if higher, convert to follower
-	rf.ConvertToFollowerIfNeeded(args.Term)
+	rf.ConvertToFollowerIfHigherTerm(args.Term)
 
 	// set the term in reply regardless
 	// reply.Term = rf.currentTerm

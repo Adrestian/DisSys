@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"log"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,7 +51,6 @@ const (
 	NO_OP_CMD = "__NO_OP"
 )
 
-//
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -60,7 +60,6 @@ const (
 // in part 2D you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -78,9 +77,7 @@ type LogEntry struct {
 	Command interface{}
 }
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
 	LastReceivedMu  sync.Mutex
 	LastReceived    time.Time     // AppendEntries/RequestVote RPC may reset the timer
@@ -124,6 +121,11 @@ type Raft struct {
 	// election Related, simple book-keeping
 	majorityVotes int
 	currentVotes  int
+
+	// Need to be stored on stable storage, related to snapshot(2D)
+	snapshot          []byte
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 // Generate a new No-op log entry from current term
@@ -161,13 +163,15 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(len(rf.log)) // encode the log length
 	e.Encode(rf.log)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
-	//Printf("[Server %v] fsync\n", rf.me)
+	//rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -195,10 +199,16 @@ func (rf *Raft) readPersist(data []byte) bool {
 
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm, votedFor, logLength int
+	var lastIncludedIndex, lastIncludedTerm, currentTerm, votedFor, logLength int
 
+	if err := d.Decode(&lastIncludedIndex); err != nil {
+		log.Fatalf("[Error] Server %v Cannot Decode lastIncludedIndex\n", rf.me)
+	}
+	if err := d.Decode(&lastIncludedTerm); err != nil {
+		log.Fatalf("[Error] Server %v Cannot Decode lastIncludedTerm\n", rf.me)
+	}
 	if err := d.Decode(&currentTerm); err != nil {
-		log.Fatalf("[Error] Server %v Cannot Decode Current Term", rf.me)
+		log.Fatalf("[Error] Server %v Cannot Decode Current Term\n", rf.me)
 	}
 	if err := d.Decode(&votedFor); err != nil {
 		log.Fatalf("[Error] Server %v Cannot Decode votedFor\n", rf.me)
@@ -206,6 +216,8 @@ func (rf *Raft) readPersist(data []byte) bool {
 	if err := d.Decode(&logLength); err != nil {
 		log.Fatalf("[Error] Server %v Cannot Decode log length\n", rf.me)
 	}
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 
@@ -233,22 +245,54 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if Debug {
+		if index > rf.commitIndex {
+			log.Fatalf("[Server %v] Cannot Snapshot uncommitted entry\n", rf.me)
+		}
+		if !rf.EntryInBound(index) {
+			log.Fatalf("[Server %v] Snapshot(): Invalid index\n", rf.me)
+		}
+	}
+	var term = rf.log[index].Term
+	rf.Compact(index, term, snapshot) // compact log
+	// fsync
+	rf.persist()
+	runtime.GC()
+}
+
+// Compact the log according to snapshot
+func (rf *Raft) Compact(lastIndex, lastTerm int, snapshot []byte) {
+	rf.snapshot = snapshot
+	rf.lastIncludedIndex = lastIndex
+	rf.lastIncludedIndex = lastTerm
+	// Optimize later ##############################################################
+	// garbage collect log
+	rf.log = rf.log[rf.lastIncludedIndex+1:] // slice the log
+	var dummy = []LogEntry{*rf.NewNoOpLogEntry()}
+	rf.log = append(dummy, rf.log...)
+	var cpy = make([]LogEntry, len(rf.log)) // create a new slice
+	var n = copy(cpy, rf.log)               // copy the whole thing
+
+	if Debug { // sanity check
+		if n != len(rf.log) {
+			log.Fatalf("[Server %v] Copy log error \n", rf.me)
+		}
+	}
+	rf.log = cpy // rf.log now points to the new compacted
+	//################################################################################
 
 }
 
-//
-// example RequestVote RPC handler.
-//
+// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.ConvertToFollowerIfNeeded(args.Term) // check the term in request args
+	rf.ConvertToFollowerIfHigherTerm(args.Term) // check the term in request args
 
-	// reply with this raft instance's term regardless
-	// reply.Term = rf.currentTerm
 	// Candidate term is too low, vote no immediately
 	var candidateTerm = args.Term
 	if candidateTerm < rf.currentTerm {
@@ -317,12 +361,6 @@ func (rf *Raft) getLastReceived() (time.Time, time.Time) {
 	return rf.LastReceived, rf.LastReceived.Add(rf.FollowerTimeout)
 }
 
-func (rf *Raft) getElectionDeadline() time.Time {
-	rf.ElectionStartedMu.Lock()
-	defer rf.ElectionStartedMu.Unlock()
-	return rf.ElectionStarted.Add(rf.ElectionTimeout)
-}
-
 // Reset the election timer
 func (rf *Raft) resetElectionTimer() {
 	rf.ElectionStartedMu.Lock()
@@ -365,6 +403,7 @@ func (rf *Raft) EntryInBound(index int) bool {
 func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	index = len(rf.log)
 	term = rf.currentTerm
 	isLeader = rf.state == Leader
@@ -375,8 +414,6 @@ func (rf *Raft) Start(command interface{}) (index int, term int, isLeader bool) 
 		Printf("[Leader %v] Start agree with %+v\n", rf.me, newEntry)
 		rf.persist()
 	}
-	// Your code here (2B).
-
 	return index, term, isLeader
 }
 
@@ -474,7 +511,7 @@ func (rf *Raft) becomeFollower(newTerm int) {
 // Check if newTerm is higher the current term
 // If so, convert to follower and return true
 // otherwise do nothing and return false
-func (rf *Raft) ConvertToFollowerIfNeeded(newTerm int) bool {
+func (rf *Raft) ConvertToFollowerIfHigherTerm(newTerm int) bool {
 	if newTerm > rf.currentTerm {
 		rf.becomeFollower(newTerm)
 		return true
@@ -504,7 +541,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 						return
 					}
 
-					if rf.ConvertToFollowerIfNeeded(reply.Term) {
+					if rf.ConvertToFollowerIfHigherTerm(reply.Term) {
 						return
 					}
 					rf.AppendEntriesReplyHandler(server, args, reply)
@@ -542,7 +579,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 				rf.mu.Lock() // lock acquired here
 				defer rf.mu.Unlock()
 				// Check for current Term, avoid outdated RPC reply
-				if !ok || rf.ConvertToFollowerIfNeeded(reply.Term) ||
+				if !ok || rf.ConvertToFollowerIfHigherTerm(reply.Term) ||
 					sentInTerm != reply.Term || args.Term != rf.currentTerm ||
 					rf.state != Candidate {
 					// !ok -> RPC failed
@@ -646,7 +683,7 @@ func (rf *Raft) sendHB() {
 			var sentInTerm = args.Term
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			if !ok || rf.ConvertToFollowerIfNeeded(reply.Term) || rf.state != Leader ||
+			if !ok || rf.ConvertToFollowerIfHigherTerm(reply.Term) || rf.state != Leader ||
 				sentInTerm != reply.Term || rf.currentTerm != sentInTerm {
 				// RPC failed or outdated
 				return
