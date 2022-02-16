@@ -14,7 +14,7 @@
 - **Finished**
 - Test:
     1. `cd src/raft`
-    2. `go test -run 2A -race`
+    2. `for i in {0..10}; do time go test -run 2A -race; done`
 ### Lab 2B: Log
 - *Finished*
 - Test:
