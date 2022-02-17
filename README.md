@@ -1,4 +1,4 @@
-# MIT 6.824 Distributed Systems Labs
+# 6.824 Distributed Systems Labs
 ## [Lab 1: MapReduce](https://pdos.csail.mit.edu/6.824/labs/lab-mr.html)
 - Test: 
     1. `cd src/main`
@@ -22,13 +22,16 @@
 - *In Progress...*
 
 ### Additional Resources
+- [Debuging](https://blog.josejg.com/debugging-pretty/)
 - [Raft Visualized](http://thesecretlivesofdata.com/raft/)
 - [Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/)
 - [Instructors' Guide to Raft](https://thesquareplanet.com/blog/instructors-guide-to-raft/)
 - [Raft Locking Advice](https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt)
 - [Raft Structure Advice](https://pdos.csail.mit.edu/6.824/labs/raft-structure.txt)
-- [John Ousterhout, UIUC lecture: Designing for Understandability: The Raft Consensus Algorithm](https://www.youtube.com/watch?v=vYp4LYbnnW8)
-- Make reading a bit easier: `$('body').style.fontFamily = "Consolas"`
+- [John Ousterhout: Designing for Understandability: The Raft Consensus Algorithm](https://www.youtube.com/watch?v=vYp4LYbnnW8)
+
+
+- Make reading a bit easier: `$('body').style.fontFamily = "Jetbrains Mono"`
 
 ## Lab 3: KV Raft
 - Idle
