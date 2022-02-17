@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"log"
 	"math"
+	"math/rand"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -831,4 +832,383 @@ func (rf *Raft) getConflictingIndex(startingIndex, xTerm int) int {
 	}
 	i++ // make sure it doesn't fall off the bound
 	return i
+}
+
+type AppendEntriesArgs struct {
+	Term         int        // leader's term
+	LeaderId     int        // so follower can redirect clients
+	PrevLogIndex int        // index of log entry immediately preceding new ones
+	PrevLogTerm  int        // term of the log entry at prevLogIndex
+	Entries      []LogEntry // log entries to store, empty for heartbeat messages
+	LeaderCommit int        // leader's commitIndex
+}
+
+type AppendEntriesReply struct {
+	Term          int  // current term, for leader to update itself
+	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	ConflictTerm  int  // Term of conflicting entry
+	ConflictIndex int  // Index of first entry with conflicting term
+	ConflictLen   int  // length of the follower's log
+}
+
+// AppendEntries RPC handler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// check RPC request's term, if higher, convert to follower
+	rf.ConvertToFollowerIfHigherTerm(args.Term)
+
+	// set the term in reply regardless
+	// reply.Term = rf.currentTerm
+
+	// ignore outdated RPC
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	// otherwise, it's a valid RPC, reset the timer
+	// This will actually cancel the election if this raft instance is in follower state
+	rf.resetFollowerTimer()
+	rf.state = Follower
+
+	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+	// or prevLogIndex points beyond the end of the log
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		// Case 3: follower doesn't have the log
+		// Follower : [4]
+		// Leader   : [4 6 6 6]
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = -1
+		reply.ConflictLen = len(rf.log)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Handle case 1 and 2
+		// Case 1: leader doesn't have follower's term
+		// F: [4 5 5]
+		// L: [4 6 6 6]
+		// Case 2: leader does have follower's term
+		// F: [4 4 4]
+		// L: [4 6 6 6]
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		var logIndex = args.PrevLogIndex
+		var entryTerm = rf.log[logIndex].Term
+		var conflictingIndex = rf.getConflictingIndex(logIndex, entryTerm)
+		reply.ConflictLen = len(rf.log)
+		reply.ConflictTerm = entryTerm
+		reply.ConflictIndex = conflictingIndex
+		return
+	}
+
+	// 3 Cases
+	// log      [1 2 3 4 5 6]
+	// entries              [7, 8]
+	var thisLastLogIndex = len(rf.log) - 1
+	if args.PrevLogIndex == thisLastLogIndex {
+		if Debug && len(args.Entries) != 0 {
+			Printf("[Server %v] Just append the log %+v\n", rf.me, args.Entries)
+		}
+		// just append
+		rf.log = append(rf.log, args.Entries...)
+		rf.persist()
+
+		reply.Term = rf.currentTerm
+		reply.Success = true // set reply.Success == True if folloer contained entry matching prevLogIndex and prevLogTerm
+	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) < len(rf.log) {
+		// check if match, otherwise clip the log,
+		// prevLogIndex == 3 in this case
+		// log      [1 2 3 4 5 6]
+		// entries        [4 5 6]
+		var argsPrevLogIndex = args.PrevLogIndex
+		var curr = argsPrevLogIndex + 1
+		var i = 0
+		for i < len(args.Entries) {
+			var logIdx = curr + i
+			if rf.log[logIdx].Term != args.Entries[i].Term {
+				rf.log = rf.log[:logIdx] // clip the log
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+			i++
+		}
+		rf.persist()
+
+		reply.Term = rf.currentTerm
+		reply.Success = true // success
+	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) >= len(rf.log) {
+		// log      [1 2 3 4 5 6]
+		// entries          [5 6 7 8]
+		//                   c
+		var argsPrevLogIndex = args.PrevLogIndex
+		var curr = argsPrevLogIndex + 1
+
+		// Check inconsistency (discard the log if necessary)
+		var logConsistent = true
+		var i = 0
+		for i = 0; curr+i < len(rf.log); i++ {
+			var logIdx = curr + i
+			if rf.log[logIdx].Term != args.Entries[i].Term {
+				logConsistent = false
+				// Clip the log, append the remainder, done
+				rf.log = rf.log[:logIdx]
+				rf.log = append(rf.log, args.Entries[i:]...)
+				break
+			}
+		}
+		// append the remainder logs if no parts of the log is discarded
+		if logConsistent {
+			rf.log = append(rf.log, args.Entries[i:]...)
+		}
+		rf.persist()
+		// TODO: Figure 2 AppendEntries RPC Receiver Implememtation $3, $4
+		// Starting from prevLogIndex
+		reply.Term = rf.currentTerm
+		reply.Success = true // success
+	} else {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		Printf("[Server %v] AppendEntries RPC handler: Should never happen: args: %+v\n", rf.me, *args)
+	}
+	// should all success at this point unless the args.PrevLogIndex is not in bound, <0 (Unchecked and unhandled)
+	// Printf("[Server %v] AppendEntries RPC Handler returns %v\n", rf.me, reply.Success)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.cond.Broadcast()
+	}
+	Printf("[Server %v]: log %+v\n", rf.me, rf.log)
+	Printf("[Server %v]: Commit Index: %v\n", rf.me, rf.commitIndex)
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// Request AppendEntries RPC call,
+// this function does not acquire the lock inside raft instance
+func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
+	reply := &AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, args, reply)
+	return reply, ok
+}
+
+// Returns a (pointer to) prepared AppendEntriesArgs struct
+// this function does not hold lock while doing so
+func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
+	var prevLogIndex = rf.nextIndex[server] - 1
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  rf.log[prevLogIndex].Term,
+		Entries:      rf.log[rf.nextIndex[server]:],
+		LeaderCommit: rf.commitIndex,
+	}
+	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
+		args.Entries = make([]LogEntry, 0)
+		if len(args.Entries) != 0 {
+			panic("not empty entry")
+		}
+	}
+	return args
+}
+
+//
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+//
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int // candidate's term
+	CandidateId  int // candidate requesting vote
+	LastLogIndex int // index of candidate's last log entry
+	LastLogTerm  int // term of candidate's last log entry
+}
+
+//
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+//
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int  // current term, for candidate to update it self
+	VoteGranted bool // true means candidates received vote
+}
+
+//
+// example code to send a RequestVote RPC to a server.
+// server is the index of the target server in rf.peers[].
+// expects RPC arguments in args.
+// fills in *reply with RPC reply, so caller should
+// pass &reply.
+// the types of the args and reply passed to Call() must be
+// the same as the types of the arguments declared in the
+// handler function (including whether they are pointers).
+//
+// The labrpc package simulates a lossy network, in which servers
+// may be unreachable, and in which requests and replies may be lost.
+// Call() sends a request and waits for a reply. If a reply arrives
+// within a timeout interval, Call() returns true; otherwise
+// Call() returns false. Thus Call() may not return for a while.
+// A false return can be caused by a dead server, a live server that
+// can't be reached, a lost request, or a lost reply.
+//
+// Call() is guaranteed to return (perhaps after a delay) *except* if the
+// handler function on the server side does not return.  Thus there
+// is no need to implement your own timeouts around Call().
+//
+// look at the comments in ../labrpc/labrpc.go for more details.
+//
+// if you're having trouble getting RPC to work, check that you've
+// capitalized all field names in structs passed over RPC, and
+// that the caller passes the address of the reply struct with &, not
+// the struct itself.
+//
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+// Wrapper around rf.sendRequestVote()
+func (rf *Raft) SendRequestVote(server int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
+	if server == rf.me {
+		log.Fatalf("[Error: Server %v] Send RequestVote RPC to itself, wtf?\n", rf.me)
+	}
+	reply := &RequestVoteReply{}
+	ok := rf.sendRequestVote(server, args, reply)
+	return reply, ok
+}
+
+func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
+	var lastLogIndex = len(rf.log) - 1
+	args := &RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  rf.log[lastLogIndex].Term,
+	}
+	return args
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term    int // Receiver's term, for leader to update itself
+	Success bool
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) SendInstallSnapshot(server int, args *InstallSnapshotArgs) (*InstallSnapshotReply, bool) {
+	reply := &InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(server, args, reply)
+	return reply, ok
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.ConvertToFollowerIfHigherTerm(args.Term)
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return // ignore outdated RPC
+	}
+
+	if args.LastIncludedTerm < rf.lastIncludedTerm || args.LastIncludedIndex < rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		return // already snapshotted! Ignore
+	}
+
+	// Back to the drawing board
+	// TODO: this code doesn't work!
+	//rf.Compact(args.LastIncludedIndex, args.LastIncludedTerm, args.Data)
+	rf.persist() // fsync before reply to RPC
+	reply.Term = rf.currentTerm
+}
+
+func min(nums ...int) int {
+	if len(nums) == 0 {
+		log.Fatalf("[Error]: in min(nums ...int), Zero Arguments\n")
+	}
+	var minimum = nums[0]
+	for _, num := range nums {
+		if num < minimum {
+			minimum = num
+		}
+	}
+	return minimum
+}
+
+func max(nums ...int) int {
+	if len(nums) == 0 {
+		log.Fatalf("[Error]: in max(nums ...int), Zero Arguments\n")
+	}
+	var maximum = nums[0]
+	for _, num := range nums {
+		if num > maximum {
+			maximum = num
+		}
+	}
+	return maximum
+}
+
+// stolen from https://stackoverflow.com/questions/55093676/checking-if-current-time-is-in-a-given-interval-golang/55093788
+func inTimeSpan(start, end, check time.Time) bool {
+	if start.Before(end) {
+		return !check.Before(start) && !check.After(end)
+	}
+	if start.Equal(end) {
+		return check.Equal(start)
+	}
+	panic("[Error]: inTimeSpan() start after end!")
+}
+
+func GetRandomTimeout(lo, hi int, unit time.Duration) time.Duration {
+	if hi-lo < 0 || lo < 0 || hi < 0 {
+		panic("[WARNING]: getRandomTimeout: Param Error")
+	}
+	return time.Duration(lo+rand.Intn(hi-lo)) * unit
+}
+
+// if call to logicalToPhysicalIndex() returns 0
+// then caller should use rf.lastIncludedIndex and rf.lastIncludedTerm
+func (rf *Raft) logicalToPhysicalIndex(index int) int {
+	/* Example:         0 1 2 3 4 5
+	original           [0 1 2 3 4 5] lastIncludedIndex = 0, lastIncludedTerm = 0
+	after compaction:  [0 4 5]     lastIncludedIndex = 3, lastIncludedTerm = 3
+	now want: index 5, actual => 5 - 3 = 2
+	now want index 3, actual => 3 - 3 = 0 // this is already invalid, remember the first entry is an invalid placeholder
+	now want index 1, actual => = -2, already included in snapshot, cannot get it
+	*/
+	var actualIndex = index - rf.lastIncludedIndex
+	if actualIndex < 0 {
+		log.Fatalf("[Server %v] PtoLIndex()\n", rf.me)
+	}
+	return actualIndex
+}
+
+func (rf *Raft) physicalToLogicalIndex(index int) int {
+	return rf.lastIncludedIndex + index - 1
+}
+
+func (rf *Raft) getLogicalLastLogEntryIndex() int {
+	if len(rf.log) == 1 {
+		return rf.lastIncludedIndex
+	}
+	return rf.lastIncludedIndex + len(rf.log) - 1
 }
