@@ -91,6 +91,9 @@ type Raft struct {
 	// on timeout, increment currentTerm, transition to candidate
 	ElectionTimeout time.Duration
 
+	applyLogEntryCh chan ApplyMsg
+	applySnapshotCh chan ApplyMsg
+
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
 	cond      *sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -272,21 +275,22 @@ func (rf *Raft) Compact(logicalLastIncludedIndex int, snapshot []byte) {
 	rf.lastIncludedTerm = lastInclTerm
 
 	// Trim the log
-	rf.log = rf.log[physicalLastIncludedIndex+1:] // slice the log
+	var tmp = rf.log[physicalLastIncludedIndex+1:] // slice the log
 	var dummy = []LogEntry{*rf.NewNoOpLogEntry()}
-	rf.log = append(dummy, rf.log...)
+	rf.log = append(dummy, tmp...)
 	var cpy = make([]LogEntry, len(rf.log)) // create a new slice
-	var n = copy(cpy, rf.log)               // copy the whole thing
-	// sanity check
-	if n != len(rf.log) {
+
+	if n := copy(cpy, rf.log); n != len(rf.log) {
 		log.Fatalf("[Server %v] Compact(): Copy log error \n", rf.me)
+	}
+	if len(rf.log) != len(tmp)+1 {
+		log.Fatalf("[Server %v] Compact() \n", rf.me)
 	}
 	// Update internal data structures
 	// rf.log now points to the new compacted log
 	rf.log = cpy
 	rf.snapshot = snapshot
 	//################################################################################
-
 }
 
 // RequestVote RPC handler.
@@ -326,9 +330,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//Printf("[Server %v] Voted NO For %v\n", rf.me, args.CandidateId)
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
+	// Don't reset Follower Timer
 }
 
-// Check if the candidate log is ok
+// Check if the candidate log is ok, should compare *Logical Log Len* NOT *Physical Log Len*
 // Return true if CANDIDATE is at least as up to date as this receiver's log, this is only ONE of the conditions to vote yes
 // Return false if candidate has out of date log
 func isCandidateLogOk(thisLastEntryIndex, thisLastEntryTerm, candidateLastEntryIndex, candidateLastEntryTerm int) bool {
@@ -380,6 +385,7 @@ func (rf *Raft) getElectionTimer() (time.Time, time.Time) {
 }
 
 // Check if the index is in bound of the log
+// Physical Index
 func (rf *Raft) EntryInBound(index int) bool {
 	if index < 0 || index >= len(rf.log) {
 		return false
@@ -525,7 +531,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 				} // Don't send to itself
 
 				if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC
-					var AEargs = rf.NewAppendEntriesArgs(server, false)
+					var args = rf.NewAppendEntriesArgs(server, false)
 					// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
 					go func(server int, args *AppendEntriesArgs) {
 						var sentInTerm = args.Term
@@ -544,11 +550,11 @@ func (rf *Raft) SendLog(interval time.Duration) {
 
 						rf.AppendEntriesReplyHandler(server, args, reply)
 
-					}(server, AEargs)
+					}(server, args)
 				} else {
 					// Follower lagging behind
 					// Send Install snapshot RPC
-					var ISargs = rf.NewInstallSnapshotArgs(server)
+					var args = rf.NewInstallSnapshotArgs(server)
 
 					go func(server int, args *InstallSnapshotArgs) {
 						var sentInTerm = args.Term
@@ -567,7 +573,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 
 						rf.InstallSnapshotReplyHandler(server, args, reply)
 
-					}(server, ISargs)
+					}(server, args)
 
 				}
 			}
@@ -639,7 +645,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 				if rf.currentVotes == rf.majorityVotes {
 					Printf("[Server %v] Received majority votes, become leader, term: %v\n", rf.me, rf.currentTerm)
 					rf.becomeLeader()
-					rf.sendHB() // Immediately send one round of heartbeat to followers
+					rf.heartBeat() // Immediately send one round of heartbeat to followers
 				}
 			}(i, requestVoteArgs)
 		}
@@ -683,23 +689,34 @@ func (rf *Raft) checkCommit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Only leader check and set commitIndex
 	if rf.state != Leader {
 		return
-	} // Only leader check and set commitIndex
-	var nPeers = len(rf.peers) - 1
-	var majority = nPeers/2 + 1
-	if nPeers%2 == 0 {
-		majority = nPeers / 2
 	}
+	// Compute majority, e.g.
+	// if total==3, majority==2, required==1, since leader is not counted,()
+	// if total==4, majority==3, required=2
+	var nPeers = len(rf.peers) - 1
+	var required int
+	if nPeers%2 == 0 {
+		required = nPeers / 2
+	} else {
+		required = nPeers/2 + 1
+	}
+
 	// only check with log entryies whose term are equal to leader's currentTerm
 	var physicalCommitIndex = rf.logicalToPhysicalIndex(rf.commitIndex)
 	// N is physical index into the log
 	for N := len(rf.log) - 1; N > max(0, physicalCommitIndex) && rf.log[N].Term == rf.currentTerm; N-- {
 		var count = 0
 		var logicalN = rf.physicalToLogicalIndex(N)
-		if logicalN != N {
-			panic("Not the same")
+
+		if Debug2ABC {
+			if logicalN != N {
+				panic("Not the same")
+			}
 		}
+
 		for i := range rf.peers {
 			if i == rf.me {
 				continue
@@ -708,7 +725,7 @@ func (rf *Raft) checkCommit() {
 				count++
 			}
 		}
-		if count >= majority {
+		if count >= required {
 			rf.commitIndex = logicalN // commitIndex also stores logical Index
 			Printf("[Leader %v] Leader Commit Set to %v\n", rf.me, N)
 			rf.matchIndex[rf.me] = logicalN
@@ -719,7 +736,7 @@ func (rf *Raft) checkCommit() {
 }
 
 // Send Heartbeat message with empty entries to follower
-func (rf *Raft) sendHB() {
+func (rf *Raft) heartBeat() {
 	if rf.state != Leader {
 		return
 	}
@@ -740,7 +757,6 @@ func (rf *Raft) sendHB() {
 			}
 
 			rf.AppendEntriesReplyHandler(server, args, reply)
-
 		}(i, appendEntriesArgs)
 	}
 }
@@ -778,7 +794,7 @@ func (rf *Raft) ApplyLogKicker(interval time.Duration) {
 
 // If commitIndex > lastApplied: increment lastApplied, apply
 // log[lastApplied] to state machine (§5.3)
-func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
+func (rf *Raft) ApplyLog(applyLogEntryCh chan ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
 
@@ -787,15 +803,15 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 		}
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			rf.applyLogEntry(rf.lastApplied, applyCh)
+			rf.applyLogEntry(rf.lastApplied, applyLogEntryCh)
 		}
 
 		rf.mu.Unlock()
 	}
 }
 
-func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
-	var applyMsg = rf.NewApplyMsg(applyIndex)
+func (rf *Raft) applyLogEntry(applyIndex int, applyLogEntryCh chan ApplyMsg) {
+	var applyMsg = rf.NewApplyLogEntry(applyIndex)
 	if Debug {
 		if rf.state == Leader {
 			Printf("[Leader %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
@@ -803,17 +819,29 @@ func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
 			Printf("[Follower %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
 		}
 	}
-	applyCh <- *applyMsg
+	applyLogEntryCh <- *applyMsg
 	Printf("[Server %v] applied Ops: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
 }
 
-func (rf *Raft) NewApplyMsg(applyIndex int) *ApplyMsg {
+func (rf *Raft) NewApplyLogEntry(applyIndex int) *ApplyMsg {
 	var applyMsg = ApplyMsg{
 		CommandValid: true,
 		Command:      rf.log[applyIndex].Command,
 		CommandIndex: applyIndex,
 	}
 	return &applyMsg
+}
+
+// Create a fan in
+func (rf *Raft) applyChHelper(applyCh chan<- ApplyMsg, applyLogEntryCh <-chan ApplyMsg, applySnapshotCh <-chan ApplyMsg) {
+	for {
+		select {
+		case msg := <-applyLogEntryCh:
+			applyCh <- msg
+		case msg := <-applySnapshotCh:
+			applyCh <- msg
+		}
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -831,14 +859,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	rf.cond = sync.NewCond(&rf.mu)
+	rf.applyLogEntryCh = make(chan ApplyMsg)
+	rf.applySnapshotCh = make(chan ApplyMsg)
 
+	var recoverFromCrash = rf.readPersist(persister.ReadRaftState())
 	// initialize from persisted state on disk before a crash
-	if rf.readPersist(persister.ReadRaftState()) {
+	if recoverFromCrash {
 		// just recovered from crash
 		rf.state = Follower
-	}
-
-	if rf.currentTerm == 0 && len(rf.log) == 0 && rf.votedFor == 0 { // Go's default init, not starting from crash
+	} else { // Not recovering from crash
 		// To Persistent Storage
 		rf.log = append(rf.log, *rf.NewNoOpLogEntry())
 
@@ -867,10 +896,13 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)         // for state == Leader
 	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond)   // for checking commit, state == leader
 	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
-	go rf.ApplyLog(applyCh)
+	go rf.applyChHelper(applyCh, rf.applyLogEntryCh, rf.applySnapshotCh)
+	go rf.ApplyLog(rf.applyLogEntryCh)
+
 	return rf
 }
 
+// TODO: Modify for 2D
 // Compute the index of first entry with conflicting term(xTerm)
 func (rf *Raft) getConflictingIndex(startingIndex, xTerm int) int {
 	var i = startingIndex - 1
@@ -898,6 +930,7 @@ type AppendEntriesReply struct {
 	ConflictLen   int  // length of the follower's log
 }
 
+// TODO: Modify for 2D
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -1049,6 +1082,7 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendE
 func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
 	var logicalPrevLogIndex = rf.nextIndex[server] - 1 // nextIndex[server] is a logical index
 	var prevLogEntryIndex = rf.logicalToPhysicalIndex(logicalPrevLogIndex)
+	// prevLogEntryIndex is physical index now
 	var prevLogEntryTerm = rf.log[prevLogEntryIndex].Term
 
 	args := &AppendEntriesArgs{
@@ -1056,7 +1090,7 @@ func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntr
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogEntryIndex,
 		PrevLogTerm:  prevLogEntryTerm,
-		Entries:      rf.log[rf.nextIndex[server]:],
+		Entries:      rf.log[rf.nextIndex[server]:], // TODO: Optimization!
 		LeaderCommit: rf.commitIndex,
 	}
 	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
@@ -1135,12 +1169,12 @@ func (rf *Raft) SendRequestVote(server int, args *RequestVoteArgs) (*RequestVote
 }
 
 func (rf *Raft) NewRequestVoteArgs() *RequestVoteArgs {
-	var lastLogIndex = len(rf.log) - 1
+	var lastLogEntryIndex, lastLogEntryTerm = rf.getLogicalLastLogEntryIndexTerm()
 	args := &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  rf.log[lastLogIndex].Term,
+		LastLogIndex: lastLogEntryIndex,
+		LastLogTerm:  lastLogEntryTerm,
 	}
 	return args
 }
