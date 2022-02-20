@@ -742,7 +742,7 @@ func (rf *Raft) checkCommit() {
 		if count >= required {
 			rf.commitIndex = logicalN // commitIndex also stores logical Index
 			Printf("[Leader %v] Leader Commit Set to %v\n", rf.me, N)
-			rf.matchIndex[rf.me] = logicalN
+			rf.matchIndex[rf.me] = logicalN // necessary?
 			rf.cond.Broadcast()
 			break
 		}
@@ -785,15 +785,15 @@ func (rf *Raft) AppendEntriesReplyHandler(server int, args *AppendEntriesArgs, r
 	}
 	// Follower reject the log because it doesn't have that entry
 	if followerMissingLog(reply) {
-		rf.nextIndex[server] = reply.ConflictLen
+		rf.nextIndex[server] = reply.XLen // both ConflictLen and ConflictIndex are logical, NOT physical
 		return
 	}
 	// Follower reject the log because of comflict
-	rf.nextIndex[server] = reply.ConflictIndex
+	rf.nextIndex[server] = reply.XIndex
 }
 
 func followerMissingLog(reply *AppendEntriesReply) bool {
-	return reply.ConflictTerm == -1 && reply.ConflictIndex == -1
+	return reply.XTerm == -1 && reply.XIndex == -1
 }
 
 // Kick {@code (rf *Raft) ApplyLog()} periodically
@@ -937,11 +937,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term          int  // current term, for leader to update itself
-	Success       bool // true if follower contained entry matching prevLogIndex and prevLogTerm
-	ConflictTerm  int  // Term of conflicting entry
-	ConflictIndex int  // Index of first entry with conflicting term
-	ConflictLen   int  // length of the follower's log
+	Term    int  // current term, for leader to update itself
+	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	XTerm   int  // Term of conflicting entry
+	XIndex  int  // Index of first entry with conflicting term
+	XLen    int  // length of the follower's log
 }
 
 // TODO: Modify for 2D
@@ -952,9 +952,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// check RPC request's term, if higher, convert to follower
 	rf.ConvertToFollowerIfHigherTerm(args.Term)
-
-	// set the term in reply regardless
-	// reply.Term = rf.currentTerm
 
 	// ignore outdated RPC
 	if args.Term < rf.currentTerm {
@@ -969,15 +966,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Reply false if log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
 	// or prevLogIndex points beyond the end of the log
-	if args.PrevLogIndex >= len(rf.log) {
+	if phyPrevLogIndex := rf.logicalToPhysicalIndex(args.PrevLogIndex); phyPrevLogIndex >= len(rf.log) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		// Case 3: follower doesn't have the log
 		// Follower : [4]
 		// Leader   : [4 6 6 6]
-		reply.ConflictTerm = -1
-		reply.ConflictIndex = -1
-		reply.ConflictLen = len(rf.log)
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = rf.getLogicalLogLength()
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
@@ -993,9 +990,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		var logIndex = args.PrevLogIndex
 		var entryTerm = rf.log[logIndex].Term
 		var conflictingIndex = rf.getConflictingIndex(logIndex, entryTerm)
-		reply.ConflictLen = len(rf.log)
-		reply.ConflictTerm = entryTerm
-		reply.ConflictIndex = conflictingIndex
+		reply.XLen = len(rf.log)
+		reply.XTerm = entryTerm
+		reply.XIndex = conflictingIndex
 		return
 	}
 
@@ -1302,8 +1299,8 @@ func GetRandomTimeout(lo, hi int, unit time.Duration) time.Duration {
 // then caller should use rf.lastIncludedIndex and rf.lastIncludedTerm
 func (rf *Raft) logicalToPhysicalIndex(logicalIndex int) int {
 	/* Example:         0 1 2 3 4 5
-	original           [0 1 2 3 4 5] lastIncludedIndex = 0, lastIncludedTerm = 0
-	after compaction:  [0 4 5]     lastIncludedIndex = 3, lastIncludedTerm = 3
+	original           [0 1 2 3 4 5] lastIncludedIndex = 0, lastIncludedTerm = 0, log length = 6
+	after compaction:  [0 4 5]     lastIncludedIndex = 3, lastIncludedTerm = 3, log length = 3
 	now want: index 5, actual => 5 - 3 = 2
 	now want index 3, actual => 3 - 3 = 0 // this is already invalid, remember the first entry is an invalid placeholder
 	now want index 1, actual => = -2, already included in snapshot, cannot get it
@@ -1347,4 +1344,8 @@ func (rf *Raft) getLogEntryTerm(logicalIndex int) int {
 		log.Fatalf("[Server %v] getLogicalLogEntryTerm(), Out of Bound\n", rf.me)
 	}
 	return rf.log[phyIdx].Term
+}
+
+func (rf *Raft) getLogicalLogLength() int {
+	return rf.lastIncludedIndex + len(rf.log)
 }
