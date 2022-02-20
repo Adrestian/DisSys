@@ -1238,6 +1238,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	//TODO: BROKEN!
 	var logicalLastIncludedIndex = args.LastIncludedIndex
 	var physicalLastIncludedIndex = rf.logicalToPhysicalIndex(logicalLastIncludedIndex)
+
 	if rf.EntryInBound(physicalLastIncludedIndex) { // already have the data, do a local compaction, throw away log
 		rf.Compact(logicalLastIncludedIndex, args.Data)
 	} else { // don't have any data, just save
@@ -1247,12 +1248,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.log = []LogEntry{*rf.NewNoOpLogEntry()}
 	}
 	rf.persist() // fsync before reply to RPC
-	reply.Term = rf.currentTerm
-	reply.Success = true
+
+	var msg = rf.NewApplyMsgSnapshot()
+	rf.applySnapshotCh <- *msg
 	// Todo:
 	// Commit this snapshot
 	// commit index?
+	// Reply to RPC
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+	reply.Term = rf.currentTerm
+	reply.Success = true
 }
 
 func min(nums ...int) int {
@@ -1352,4 +1357,14 @@ func (rf *Raft) getLogEntryTerm(logicalIndex int) int {
 
 func (rf *Raft) getLogicalLogLength() int {
 	return rf.lastIncludedIndex + len(rf.log)
+}
+
+func (rf *Raft) NewApplyMsgSnapshot() *ApplyMsg {
+	var m = ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapshot,
+		SnapshotTerm:  rf.lastIncludedTerm,
+		SnapshotIndex: rf.lastIncludedIndex,
+	}
+	return &m
 }
