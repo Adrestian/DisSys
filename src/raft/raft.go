@@ -91,8 +91,8 @@ type Raft struct {
 	// on timeout, increment currentTerm, transition to candidate
 	ElectionTimeout time.Duration
 
-	applyLogEntryCh chan ApplyMsg
-	applySnapshotCh chan ApplyMsg
+	// applyLogEntryCh chan ApplyMsg
+	// applySnapshotCh chan ApplyMsg
 
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
 	cond      *sync.Cond
@@ -124,9 +124,10 @@ type Raft struct {
 	currentVotes  int
 
 	// Persist on stable storage, related to snapshot(2D)
-	snapshot          []byte
-	lastIncludedIndex int
-	lastIncludedTerm  int
+	snapshot            []byte
+	lastIncludedIndex   int
+	lastIncludedTerm    int
+	shouldApplySnapshot bool
 }
 
 // Generate a new No-op log entry from current term
@@ -244,6 +245,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
 	Printf("[Server %v] Snapshot() \n", rf.me)
 	Printf("LastIncludedIndex %v, snapshot: %+v\n", logicalLastIncludedIndex, snapshot)
+
+	// rf.mu.Unlock() // god damn, the caller already have the rf.mu
+	// Printf("[Server %v] Snapshot() Double locking \n", rf.me)
+
+	rf.mu.Unlock() // WTF? Caller already have the lock?
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -815,8 +821,15 @@ func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
 
-		for !(rf.commitIndex > rf.lastApplied) {
+		for !(rf.commitIndex > rf.lastApplied) && !rf.shouldApplySnapshot {
 			rf.cond.Wait()
+		}
+		if rf.shouldApplySnapshot {
+			var msg = rf.NewApplyMsgSnapshot()
+			applyCh <- *msg
+			rf.shouldApplySnapshot = false
+			rf.lastApplied = rf.lastIncludedIndex
+			rf.commitIndex = rf.lastIncludedIndex
 		}
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
@@ -878,16 +891,16 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.persister = persister
 	rf.me = me
 	rf.cond = sync.NewCond(&rf.mu)
-	rf.applyLogEntryCh = make(chan ApplyMsg)
-	rf.applySnapshotCh = make(chan ApplyMsg)
 
-	var recoverFromCrash = rf.readPersist(persister.ReadRaftState())
 	// initialize from persisted state on disk before a crash
-	if recoverFromCrash {
+	if rf.readPersist(persister.ReadRaftState()) {
 		Printf("[Server %v] Recover from crash\n", rf.me)
 		// just recovered from crash
 		rf.state = Follower
 		rf.snapshot = persister.ReadSnapshot()
+		// ##############################
+		// TODO: apply snapshot?????????
+		// ##############################
 	} else { // Not recovering from crash
 		// To Persistent Storage
 		Printf("[Server %v] Init\n", rf.me)
@@ -1268,14 +1281,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persist() // fsync before reply to RPC
 	rf.resetFollowerTimer()
 
-	var msg = rf.NewApplyMsgSnapshot()
-	rf.applySnapshotCh <- *msg
+	// var msg = rf.NewApplyMsgSnapshot()
+	// rf.applySnapshotCh <- *msg
 	// Todo:
 	// Commit this snapshot
 	// commit index?
 	// Reply to RPC
-	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
-	rf.lastApplied = rf.commitIndex
+	rf.shouldApplySnapshot = true
 	rf.cond.Broadcast()
 	reply.Term = rf.currentTerm
 	reply.Success = true
