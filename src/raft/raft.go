@@ -1227,21 +1227,20 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term < rf.currentTerm || args.LastIncludedIndex < rf.lastIncludedIndex {
 		// ignore outdated RPC and ignore outdated snapshot
+		// Since the snapshot is already committed, no need to do term check
+		// instead make sure our receiving peer does not go back to an older state with
+		// lastIncludedIndex check
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	// Since the snapshot is already committed, no need to do term check
-	// instead make sure our receiving peer does not go back to an older state with
-	// lastIncludedIndex check
-
 	//TODO: BROKEN!
 	var logicalLastIncludedIndex = args.LastIncludedIndex
 	var physicalLastIncludedIndex = rf.logicalToPhysicalIndex(logicalLastIncludedIndex)
-	if rf.EntryInBound(physicalLastIncludedIndex) {
+	if rf.EntryInBound(physicalLastIncludedIndex) { // already have the data, do a local compaction, throw away log
 		rf.Compact(logicalLastIncludedIndex, args.Data)
-	} else {
+	} else { // don't have any data, just save
 		rf.snapshot = args.Data
 		rf.lastIncludedIndex = args.LastIncludedIndex
 		rf.lastIncludedTerm = args.LastIncludedTerm
