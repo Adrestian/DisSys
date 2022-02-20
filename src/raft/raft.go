@@ -918,8 +918,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 // TODO: Modify for 2D
 // Compute the index of first entry with conflicting term(xTerm)
-func (rf *Raft) getConflictingIndex(startingIndex, xTerm int) int {
-	var i = startingIndex - 1
+// @param physcialStartingIndex: NOT LOGICAL INDEX
+// @return Physical XIndex
+func (rf *Raft) getConflictingIndex(physicalStartingIndex, xTerm int) int {
+	var i = physicalStartingIndex - 1
 	for i >= 1 && rf.log[i].Term >= xTerm {
 		i--
 	}
@@ -977,7 +979,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = rf.getLogicalLogLength()
 		return
 	}
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if phyPrevLogIndex := rf.logicalToPhysicalIndex(args.PrevLogIndex); rf.log[phyPrevLogIndex].Term != args.PrevLogTerm {
 		// Handle case 1 and 2
 		// Case 1: leader doesn't have follower's term
 		// F: [4 5 5]
@@ -987,11 +989,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// L: [4 6 6 6]
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		var logIndex = args.PrevLogIndex
-		var entryTerm = rf.log[logIndex].Term
-		var conflictingIndex = rf.getConflictingIndex(logIndex, entryTerm)
+		var entryTerm = rf.log[phyPrevLogIndex].Term
+		var phyConflictingIndex = rf.getConflictingIndex(phyPrevLogIndex, entryTerm)
+
 		reply.XLen = len(rf.log)
 		reply.XTerm = entryTerm
+		// getConflictingIndex returns a physcial index, convert it to a *logical* index
+		var conflictingIndex = rf.physicalToLogicalIndex(phyConflictingIndex)
 		reply.XIndex = conflictingIndex
 		return
 	}
