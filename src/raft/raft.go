@@ -530,59 +530,63 @@ func (rf *Raft) shouldUseAppendEntriesRPC(server int) bool {
 func (rf *Raft) SendLog(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state == Leader { // Send Follower log
-			for server := range rf.peers {
-				if server == rf.me {
-					continue
-				} // Don't send to itself
+		if rf.state != Leader {
+			rf.mu.Unlock()
+			time.Sleep(interval)
+			continue
+		}
+		// Send Follower log
+		for server := range rf.peers {
+			if server == rf.me {
+				continue
+			} // Don't send to itself
 
-				// TODO: FIX THIS Later
-				if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC //BUG!!
-					var args = rf.NewAppendEntriesArgs(server, false)
-					// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
-					go func(server int, args *AppendEntriesArgs) {
-						var sentInTerm = args.Term
-						var reply, ok = rf.SendAppendEntries(server, args)
+			// TODO: FIX THIS Later
+			if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC //BUG!!
+				var args = rf.NewAppendEntriesArgs(server, false)
+				// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
+				go func(server int, args *AppendEntriesArgs) {
+					var sentInTerm = args.Term
+					var reply, ok = rf.SendAppendEntries(server, args)
 
-						if !ok {
-							return
-						}
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
+					if !ok {
+						return
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
 
-						if rf.state != Leader || sentInTerm != reply.Term ||
-							rf.currentTerm != args.Term || rf.ConvertToFollowerIfHigherTerm(reply.Term) {
-							return
-						}
+					if rf.state != Leader || sentInTerm != reply.Term ||
+						rf.currentTerm != args.Term || rf.ConvertToFollowerIfHigherTerm(reply.Term) {
+						return
+					}
 
-						rf.AppendEntriesReplyHandler(server, args, reply)
+					rf.AppendEntriesReplyHandler(server, args, reply)
 
-					}(server, args)
-				} else {
-					// Follower lagging behind
-					// Send Install snapshot RPC
-					var args = rf.NewInstallSnapshotArgs(server)
+				}(server, args)
+			} else {
+				// Follower lagging behind
+				// Send Install snapshot RPC
+				var args = rf.NewInstallSnapshotArgs(server)
 
-					go func(server int, args *InstallSnapshotArgs) {
-						var sentInTerm = args.Term
-						reply, ok := rf.SendInstallSnapshot(server, args)
+				go func(server int, args *InstallSnapshotArgs) {
+					var sentInTerm = args.Term
+					reply, ok := rf.SendInstallSnapshot(server, args)
 
-						if !ok {
-							return
-						}
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
+					if !ok {
+						return
+					}
+					rf.mu.Lock()
+					defer rf.mu.Unlock()
 
-						if rf.state != Leader || sentInTerm != reply.Term ||
-							rf.currentTerm != sentInTerm || rf.ConvertToFollowerIfHigherTerm(reply.Term) {
-							return
-						}
+					if rf.state != Leader || sentInTerm != reply.Term ||
+						rf.currentTerm != sentInTerm || rf.ConvertToFollowerIfHigherTerm(reply.Term) {
+						return
+					}
 
-						rf.InstallSnapshotReplyHandler(server, args, reply)
+					rf.InstallSnapshotReplyHandler(server, args, reply)
 
-					}(server, args)
+				}(server, args)
 
-				}
 			}
 		}
 		rf.mu.Unlock()
@@ -665,11 +669,11 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 		for inTimeSpan(electionStarted, electionDeadline, now) {
 			time.Sleep(checkInterval)
 			rf.mu.Lock()
-			var state = rf.state
-			if state == Leader {
+			if rf.state == Leader {
 				rf.mu.Unlock() // exit 1
 				return true
-			} else if state == Follower { // Candidate receive valid RPC AppendEntries
+			}
+			if rf.state == Follower { // Candidate receive valid RPC AppendEntries
 				rf.mu.Unlock() // exit 2
 				return false
 			}
@@ -678,7 +682,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 		} // on timeout, go to the next iteration, increment term, send RPCs, etc
 		if Debug {
 			rf.mu.Lock()
-			Printf("[Server %v] received %v votes\n", rf.me, rf.currentVotes)
+			Printf("[Server %v] Timeout, received %v votes for term %v\n", rf.me, rf.currentVotes, rf.currentTerm)
 			rf.mu.Unlock()
 		}
 		// ##########################################################
