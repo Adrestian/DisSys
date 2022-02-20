@@ -191,7 +191,7 @@ func (rf *Raft) persist() {
 // }
 func (rf *Raft) readPersist(data []byte) bool {
 	if len(data) == 0 { // nothing to read
-		Printf("[Server %v] Nothing to read\n", rf.me)
+		//Printf("[Server %v] Nothing to read\n", rf.me)
 		return false
 	}
 
@@ -225,7 +225,7 @@ func (rf *Raft) readPersist(data []byte) bool {
 	}
 	rf.log = logEntry
 	//rf.leaderInit()
-	Printf("[Server %v] Read From Disk: Log %+v\n", rf.me, rf.log)
+	//Printf("[Server %v] Read From Disk: Log %+v\n", rf.me, rf.log)
 	return true
 }
 
@@ -357,7 +357,7 @@ func (rf *Raft) resetFollowerTimer() {
 	defer rf.LastReceivedMu.Unlock()
 	rf.LastReceived = time.Now()
 	rf.FollowerTimeout = GetRandomTimeout(FOLLOWER_TIMEOUT_LOWER, FOLLOWER_TIMEOUT_UPPER, time.Millisecond)
-	Printf("[Server %v]: Reset Follower Time out: %v\n", rf.me, rf.FollowerTimeout)
+	//Printf("[Server %v]: Reset Follower Time out: %v\n", rf.me, rf.FollowerTimeout)
 }
 
 // Accessor function for LastReceived and ddl for timeout
@@ -373,7 +373,7 @@ func (rf *Raft) resetElectionTimer() {
 	defer rf.ElectionStartedMu.Unlock()
 	rf.ElectionTimeout = GetRandomTimeout(ELECTION_TIMEOUT_LOWER, ELECTION_TIMEOUT_UPPER, time.Millisecond)
 	rf.ElectionStarted = time.Now()
-	Printf("ElectionStarted: %v, ElectionTimeout: %v\n", rf.ElectionStarted, rf.ElectionTimeout)
+	//Printf("[Server %v]: Reset Election Timer \n", rf.me)
 }
 
 // Return when the election started, and when the election expires
@@ -522,9 +522,9 @@ func (rf *Raft) ConvertToFollowerIfHigherTerm(newTerm int) bool {
 	return false
 }
 
-// TODO: BUGGED!
-func (rf *Raft) shouldUseAppendEntriesRPC(server int) bool {
-	return rf.matchIndex[server] > rf.lastIncludedIndex
+func (rf *Raft) HaveLogEntry(server int) bool {
+	var logicalIndex = rf.nextIndex[server]
+	return logicalIndex > rf.lastIncludedIndex
 }
 
 func (rf *Raft) SendLog(interval time.Duration) {
@@ -542,7 +542,8 @@ func (rf *Raft) SendLog(interval time.Duration) {
 			} // Don't send to itself
 
 			// TODO: FIX THIS Later
-			if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC //BUG!!
+			if rf.HaveLogEntry(server) { // use AE RPC //BUG!!
+				Printf("[Leader %v] Send AE to %v\n", rf.me, server)
 				var args = rf.NewAppendEntriesArgs(server, false)
 				// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
 				go func(server int, args *AppendEntriesArgs) {
@@ -564,6 +565,7 @@ func (rf *Raft) SendLog(interval time.Duration) {
 
 				}(server, args)
 			} else {
+				Printf("[Leader %v] Send Installsnapshot to %v\n", rf.me, server)
 				// Follower lagging behind
 				// Send Install snapshot RPC
 				var args = rf.NewInstallSnapshotArgs(server)
@@ -682,7 +684,7 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 		} // on timeout, go to the next iteration, increment term, send RPCs, etc
 		if Debug {
 			rf.mu.Lock()
-			Printf("[Server %v] Timeout, received %v votes for term %v\n", rf.me, rf.currentVotes, rf.currentTerm)
+			Printf("[Server %v] Not Enough Votes, received %v votes for term %v\n", rf.me, rf.currentVotes, rf.currentTerm)
 			rf.mu.Unlock()
 		}
 		// ##########################################################
@@ -724,12 +726,6 @@ func (rf *Raft) checkCommit() {
 	for N := len(rf.log) - 1; N > max(0, physicalCommitIndex) && rf.log[N].Term == rf.currentTerm; N-- {
 		var count = 0
 		var logicalN = rf.physicalToLogicalIndex(N)
-
-		if Debug2ABC {
-			if logicalN != N {
-				panic("Not the same")
-			}
-		}
 
 		for i := range rf.peers {
 			if i == rf.me {
@@ -1258,6 +1254,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
 	reply.Term = rf.currentTerm
 	reply.Success = true
+	Printf("[Server %v] Snapshot Applied\n", rf.me)
+
 }
 
 func min(nums ...int) int {
