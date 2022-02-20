@@ -249,9 +249,8 @@ func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
 	// rf.mu.Unlock() // god damn, the caller already have the rf.mu
 	// Printf("[Server %v] Snapshot() Double locking \n", rf.me)
 
-	rf.mu.Unlock() // WTF? Caller already have the lock?
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	// rf.mu.Lock()
+	// defer rf.mu.Unlock()
 
 	Printf("[Server %v] In Snapshot()\n", rf.me)
 	//Leader cannot snapshot uncommitted log entry
@@ -934,7 +933,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	//	go rf.applyChHelper(applyCh, rf.applyLogEntryCh, rf.applySnapshotCh)
 	go rf.ApplyLog(applyCh)
 
-	if Debug {
+	if DebugLiveLock {
 		go func() {
 			for {
 				log.Printf("[Server %v] Alive\n", rf.me)
