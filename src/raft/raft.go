@@ -522,6 +522,11 @@ func (rf *Raft) ConvertToFollowerIfHigherTerm(newTerm int) bool {
 	return false
 }
 
+// TODO: BUGGED!
+func (rf *Raft) shouldUseAppendEntriesRPC(server int) bool {
+	return rf.matchIndex[server] > rf.lastIncludedIndex
+}
+
 func (rf *Raft) SendLog(interval time.Duration) {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -531,7 +536,8 @@ func (rf *Raft) SendLog(interval time.Duration) {
 					continue
 				} // Don't send to itself
 
-				if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC
+				// TODO: FIX THIS Later
+				if rf.nextIndex[server] > rf.lastIncludedIndex { // use AE RPC //BUG!!
 					var args = rf.NewAppendEntriesArgs(server, false)
 					// Printf("[Leader %v] term: %v send out log to follower %v\n", rf.me, rf.currentTerm, server)
 					go func(server int, args *AppendEntriesArgs) {
@@ -1084,15 +1090,15 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendE
 // Returns a (pointer to) prepared AppendEntriesArgs struct
 // this function does not hold lock while doing so
 func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntriesArgs {
-	var logicalPrevLogIndex = rf.nextIndex[server] - 1 // nextIndex[server] is a logical index
-	var prevLogEntryIndex = rf.logicalToPhysicalIndex(logicalPrevLogIndex)
+	var logicalPrevLogEntryIndex = rf.nextIndex[server] - 1 // nextIndex[server] is a logical index
+	//var physicalPrevLogEntryIndex = rf.logicalToPhysicalIndex(logicalPrevLogEntryIndex)
 	// prevLogEntryIndex is physical index now
-	var prevLogEntryTerm = rf.log[prevLogEntryIndex].Term
+	var prevLogEntryTerm = rf.getLogEntryTerm(logicalPrevLogEntryIndex)
 
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: prevLogEntryIndex,
+		PrevLogIndex: logicalPrevLogEntryIndex,
 		PrevLogTerm:  prevLogEntryTerm,
 		Entries:      rf.log[rf.nextIndex[server]:], // TODO: Optimization!
 		LeaderCommit: rf.commitIndex,
@@ -1324,4 +1330,17 @@ func (rf *Raft) getLogicalLastLogEntryIndexTerm() (int, int) {
 	var idx = len(rf.log) - 1 // idx is physical index
 	var logicalIdx = rf.physicalToLogicalIndex(idx)
 	return logicalIdx, rf.log[idx].Term
+}
+
+// @Param logicalIndex
+// Given a logicalIndex, return its corresponding term
+func (rf *Raft) getLogEntryTerm(logicalIndex int) int {
+	phyIdx := rf.logicalToPhysicalIndex(logicalIndex)
+	if phyIdx == 0 {
+		return rf.lastIncludedTerm
+	}
+	if !rf.EntryInBound(phyIdx) {
+		log.Fatalf("[Server %v] getLogicalLogEntryTerm(), Out of Bound\n", rf.me)
+	}
+	return rf.log[phyIdx].Term
 }
