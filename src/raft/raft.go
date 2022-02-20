@@ -1003,7 +1003,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 3 Cases
 	// log      [1 2 3 4 5 6]
 	// entries              [7, 8]
-	var thisLastLogIndex = len(rf.log) - 1
+	var thisLastLogIndex, _ = rf.getLogicalLastLogEntryIndexTerm()
 	if args.PrevLogIndex == thisLastLogIndex {
 		if Debug && len(args.Entries) != 0 {
 			Printf("[Server %v] Just append the log %+v\n", rf.me, args.Entries)
@@ -1011,19 +1011,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// just append
 		rf.log = append(rf.log, args.Entries...)
 		rf.persist()
-
 		reply.Term = rf.currentTerm
 		reply.Success = true // set reply.Success == True if folloer contained entry matching prevLogIndex and prevLogTerm
-	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) < len(rf.log) {
+
+	} else if phyPrevLogIndex := rf.logicalToPhysicalIndex(args.PrevLogIndex); rf.EntryInBound(phyPrevLogIndex) && phyPrevLogIndex+len(args.Entries) < len(rf.log) {
 		// check if match, otherwise clip the log,
 		// prevLogIndex == 3 in this case
 		// log      [1 2 3 4 5 6]
 		// entries        [4 5 6]
-		var argsPrevLogIndex = args.PrevLogIndex
-		var curr = argsPrevLogIndex + 1
+		var curr = phyPrevLogIndex + 1 // curr is physical index
 		var i = 0
 		for i < len(args.Entries) {
-			var logIdx = curr + i
+			// i is physical index, used for indexing into args.Entries[],
+			// logIdx is a physical index, used for indexing into rf.log[]
+			var logIdx = curr + i // logIdx is init to curr
 			if rf.log[logIdx].Term != args.Entries[i].Term {
 				rf.log = rf.log[:logIdx] // clip the log
 				rf.log = append(rf.log, args.Entries[i:]...)
@@ -1032,9 +1033,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			i++
 		}
 		rf.persist()
-
 		reply.Term = rf.currentTerm
 		reply.Success = true // success
+
 	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) >= len(rf.log) {
 		// log      [1 2 3 4 5 6]
 		// entries          [5 6 7 8]
