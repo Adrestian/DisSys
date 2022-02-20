@@ -243,9 +243,11 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
 	Printf("[Server %v] Snapshot() \n", rf.me)
+	Printf("LastIncludedIndex %v, snapshot: %+v\n", logicalLastIncludedIndex, snapshot)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	Printf("[Server %v] In Snapshot()\n", rf.me)
 	//Leader cannot snapshot uncommitted log entry
 	if logicalLastIncludedIndex > rf.commitIndex {
 		log.Fatalf("[Server %v] Cannot Snapshot uncommitted entry\n", rf.me)
@@ -258,6 +260,7 @@ func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
 	// flush to stable storage
 	rf.persist()
 	runtime.GC()
+	Printf("[Server %v] Exit Snapshot() \n", rf.me)
 }
 
 // Compact the log according to snapshot
@@ -808,7 +811,7 @@ func (rf *Raft) ApplyLogKicker(interval time.Duration) {
 
 // If commitIndex > lastApplied: increment lastApplied, apply
 // log[lastApplied] to state machine (§5.3)
-func (rf *Raft) ApplyLog(applyLogEntryCh chan ApplyMsg) {
+func (rf *Raft) ApplyLog(applyCh chan ApplyMsg) {
 	for !rf.killed() {
 		rf.mu.Lock()
 
@@ -817,7 +820,7 @@ func (rf *Raft) ApplyLog(applyLogEntryCh chan ApplyMsg) {
 		}
 		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
-			rf.applyLogEntry(rf.lastApplied, applyLogEntryCh)
+			rf.applyLogEntry(rf.lastApplied, applyCh)
 		}
 
 		rf.mu.Unlock()
@@ -825,9 +828,9 @@ func (rf *Raft) ApplyLog(applyLogEntryCh chan ApplyMsg) {
 }
 
 // @Param applyIndex is logical
-func (rf *Raft) applyLogEntry(applyIndex int, applyLogEntryCh chan ApplyMsg) {
+func (rf *Raft) applyLogEntry(applyIndex int, applyCh chan ApplyMsg) {
 	var applyMsg = rf.NewApplyLogEntry(applyIndex)
-	applyLogEntryCh <- *applyMsg
+	applyCh <- *applyMsg
 	if Debug {
 		if rf.state == Leader {
 			Printf("[Leader %v] applied entry: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
@@ -915,8 +918,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.SendLog(time.Duration(SEND_LOG_INTERVAL) * time.Millisecond)         // for state == Leader
 	go rf.LeaderCommit(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond)   // for checking commit, state == leader
 	go rf.ApplyLogKicker(time.Duration(APPLY_LOG_INTERVAL) * time.Millisecond) // for apply changes
-	go rf.applyChHelper(applyCh, rf.applyLogEntryCh, rf.applySnapshotCh)
-	go rf.ApplyLog(rf.applyLogEntryCh)
+	//	go rf.applyChHelper(applyCh, rf.applyLogEntryCh, rf.applySnapshotCh)
+	go rf.ApplyLog(applyCh)
 
 	if Debug {
 		go func() {
@@ -1113,13 +1116,14 @@ func (rf *Raft) NewAppendEntriesArgs(server int, useEmptyEntry bool) *AppendEntr
 	//var physicalPrevLogEntryIndex = rf.logicalToPhysicalIndex(logicalPrevLogEntryIndex)
 	// prevLogEntryIndex is physical index now
 	var prevLogEntryTerm = rf.getLogEntryTerm(logicalPrevLogEntryIndex)
+	var phyPrevLogEntryIndex = rf.logicalToPhysicalIndex(logicalPrevLogEntryIndex)
 
 	args := &AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: logicalPrevLogEntryIndex,
 		PrevLogTerm:  prevLogEntryTerm,
-		Entries:      rf.log[rf.nextIndex[server]:], // TODO: Optimization!
+		Entries:      rf.log[phyPrevLogEntryIndex+1:], // TODO: Optimization!
 		LeaderCommit: rf.commitIndex,
 	}
 	if useEmptyEntry { // if useEmptyEntry flag is set to true, attach empty log to it
@@ -1236,6 +1240,7 @@ func (rf *Raft) SendInstallSnapshot(server int, args *InstallSnapshotArgs) (*Ins
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	Printf("[Server %v] Received InstallSnapshot RPC\n", rf.me)
 	rf.ConvertToFollowerIfHigherTerm(args.Term)
 
 	if args.Term < rf.currentTerm || args.LastIncludedIndex < rf.lastIncludedIndex {
@@ -1270,6 +1275,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// commit index?
 	// Reply to RPC
 	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+	rf.lastApplied = rf.commitIndex
+	rf.cond.Broadcast()
 	reply.Term = rf.currentTerm
 	reply.Success = true
 	Printf("[Server %v] Snapshot Applied\n", rf.me)
