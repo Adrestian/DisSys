@@ -41,12 +41,12 @@ const (
 	// if no appendentries RPC has been received from leader or voted for other candidates
 	FOLLOWER_TIMEOUT_UPPER int = 1200
 
-	SEND_LOG_INTERVAL int = 75 // highest rate capped at 10/sec
-	TICKER_INTERVAL   int = 5
+	SEND_LOG_INTERVAL int = 100 // highest rate capped at 10/sec
+	TICKER_INTERVAL   int = 10
 
 	ELECTION_TIMEOUT_LOWER     int = 300
 	ELECTION_TIMEOUT_UPPER     int = 1000
-	ELECTION_CHECKING_INTERVAL int = 5
+	ELECTION_CHECKING_INTERVAL int = 10
 
 	APPLY_LOG_INTERVAL int = 5
 
@@ -242,6 +242,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
+	Printf("[Server %v] Snapshot() \n", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -604,6 +605,9 @@ func (rf *Raft) NewInstallSnapshotArgs(server int) *InstallSnapshotArgs {
 		LastIncludedTerm:  rf.lastIncludedTerm,
 		Data:              rf.snapshot,
 	}
+	if len(args.Data) == 0 {
+		panic("Empty snapshot wtf?")
+	}
 	return &args
 }
 
@@ -820,23 +824,25 @@ func (rf *Raft) ApplyLog(applyLogEntryCh chan ApplyMsg) {
 	}
 }
 
+// @Param applyIndex is logical
 func (rf *Raft) applyLogEntry(applyIndex int, applyLogEntryCh chan ApplyMsg) {
 	var applyMsg = rf.NewApplyLogEntry(applyIndex)
+	applyLogEntryCh <- *applyMsg
 	if Debug {
 		if rf.state == Leader {
-			Printf("[Leader %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
+			Printf("[Leader %v] applied entry: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
 		} else {
-			Printf("[Follower %v] apply log entry: %+v\n", rf.me, rf.log[applyIndex])
+			Printf("[Server %v] applied entry: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
 		}
 	}
-	applyLogEntryCh <- *applyMsg
-	Printf("[Server %v] applied Ops: %+v with index %v\n", rf.me, applyMsg.Command, applyMsg.CommandIndex)
 }
 
+// @Param applyIndex is logical
 func (rf *Raft) NewApplyLogEntry(applyIndex int) *ApplyMsg {
+	var phyIndex = rf.logicalToPhysicalIndex(applyIndex)
 	var applyMsg = ApplyMsg{
 		CommandValid: true,
-		Command:      rf.log[applyIndex].Command,
+		Command:      rf.log[phyIndex].Command,
 		CommandIndex: applyIndex,
 	}
 	return &applyMsg
@@ -875,12 +881,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	var recoverFromCrash = rf.readPersist(persister.ReadRaftState())
 	// initialize from persisted state on disk before a crash
 	if recoverFromCrash {
+		Printf("[Server %v] Recover from crash\n", rf.me)
 		// just recovered from crash
 		rf.state = Follower
+		rf.snapshot = persister.ReadSnapshot()
 	} else { // Not recovering from crash
 		// To Persistent Storage
+		Printf("[Server %v] Init\n", rf.me)
 		rf.log = append(rf.log, *rf.NewNoOpLogEntry())
-
+		rf.snapshot = nil
 		// Your initialization code here (2A, 2B, 2C).
 		rf.becomeFollower(0) // on boot init to follower
 
@@ -909,6 +918,14 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	go rf.applyChHelper(applyCh, rf.applyLogEntryCh, rf.applySnapshotCh)
 	go rf.ApplyLog(rf.applyLogEntryCh)
 
+	if Debug {
+		go func() {
+			for {
+				log.Printf("[Server %v] Alive\n", rf.me)
+				time.Sleep(1 * time.Second)
+			}
+		}()
+	}
 	return rf
 }
 
@@ -1244,6 +1261,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.log = []LogEntry{*rf.NewNoOpLogEntry()}
 	}
 	rf.persist() // fsync before reply to RPC
+	rf.resetFollowerTimer()
 
 	var msg = rf.NewApplyMsgSnapshot()
 	rf.applySnapshotCh <- *msg
