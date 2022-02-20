@@ -263,9 +263,8 @@ func (rf *Raft) Snapshot(logicalLastIncludedIndex int, snapshot []byte) {
 // {@param lastIndex are logical index!}
 func (rf *Raft) Compact(logicalLastIncludedIndex int, snapshot []byte) {
 	// Optimize later ##############################################################
-	// garbage collect log
 
-	//Convert Logicial to Physical
+	// Convert Logicial to Physical
 	var physicalLastIncludedIndex = rf.logicalToPhysicalIndex(logicalLastIncludedIndex)
 	if !rf.EntryInBound(physicalLastIncludedIndex) {
 		log.Fatalf("[Server %v]: Compact() Out of bound\n", rf.me)
@@ -333,6 +332,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Don't reset Follower Timer
 }
 
+// @params: ALL params {@code thisLastEntryIndex, candidateLastEntryIndex } are logical!
 // Check if the candidate log is ok, should compare *Logical Log Len* NOT *Physical Log Len*
 // Return true if CANDIDATE is at least as up to date as this receiver's log, this is only ONE of the conditions to vote yes
 // Return false if candidate has out of date log
@@ -385,9 +385,9 @@ func (rf *Raft) getElectionTimer() (time.Time, time.Time) {
 }
 
 // Check if the index is in bound of the log
-// Physical Index
-func (rf *Raft) EntryInBound(index int) bool {
-	if index < 0 || index >= len(rf.log) {
+// @Param index: Physical Index
+func (rf *Raft) EntryInBound(physicalIndex int) bool {
+	if physicalIndex < 0 || physicalIndex >= len(rf.log) {
 		return false
 	}
 	return true
@@ -489,7 +489,8 @@ func (rf *Raft) becomeLeader() {
 // matchIndex[]: for each server, index of highest log entry known to be replicated on server
 // init to 0, increase monotonically
 func (rf *Raft) leaderInit() {
-	var leaderLastLogIndex = len(rf.log) - 1
+	// matchIndex[] and nextIndex[] are ALL logical index
+	var leaderLastLogIndex, _ = rf.getLogicalLastLogEntryIndexTerm()
 	for i := range rf.nextIndex {
 		rf.nextIndex[i] = leaderLastLogIndex + 1
 	}
@@ -669,8 +670,11 @@ func (rf *Raft) startElection(checkInterval time.Duration) bool {
 			rf.mu.Unlock() // exit 3
 			now = time.Now()
 		} // on timeout, go to the next iteration, increment term, send RPCs, etc
-		Printf("[Server %v] received %v votes\n", rf.me, rf.currentVotes)
-
+		if Debug {
+			rf.mu.Lock()
+			Printf("[Server %v] received %v votes\n", rf.me, rf.currentVotes)
+			rf.mu.Unlock()
+		}
 		// ##########################################################
 	}
 	return false
@@ -1286,7 +1290,7 @@ func GetRandomTimeout(lo, hi int, unit time.Duration) time.Duration {
 
 // if call to logicalToPhysicalIndex() returns 0
 // then caller should use rf.lastIncludedIndex and rf.lastIncludedTerm
-func (rf *Raft) logicalToPhysicalIndex(index int) int {
+func (rf *Raft) logicalToPhysicalIndex(logicalIndex int) int {
 	/* Example:         0 1 2 3 4 5
 	original           [0 1 2 3 4 5] lastIncludedIndex = 0, lastIncludedTerm = 0
 	after compaction:  [0 4 5]     lastIncludedIndex = 3, lastIncludedTerm = 3
@@ -1294,19 +1298,20 @@ func (rf *Raft) logicalToPhysicalIndex(index int) int {
 	now want index 3, actual => 3 - 3 = 0 // this is already invalid, remember the first entry is an invalid placeholder
 	now want index 1, actual => = -2, already included in snapshot, cannot get it
 	*/
-	var actualIndex = index - rf.lastIncludedIndex
-	if actualIndex < 0 {
-		log.Printf("[Server %v] logicalToPhysicalIndex() < 0\n", rf.me)
+	var physicalIndex = logicalIndex - rf.lastIncludedIndex
+	if physicalIndex < 0 {
+		log.Printf("[Server %v] logicalToPhysicalIndex() returns < 0\n", rf.me)
 	}
-	return actualIndex
+	return physicalIndex
 }
 
 // Logical Index are the index described in the raft paper
 // Physical Index are used to index into rf.log[] (after compaction, physical index != logical index)
-func (rf *Raft) physicalToLogicalIndex(index int) int {
-	return rf.lastIncludedIndex + index
+func (rf *Raft) physicalToLogicalIndex(physicalIndex int) int {
+	return rf.lastIncludedIndex + physicalIndex
 }
 
+// @return: logical last index on the log(may be compacted) and its associated term
 func (rf *Raft) getLogicalLastLogEntryIndexTerm() (int, int) {
 	if Debug {
 		if rf.lastIncludedIndex < 0 {
@@ -1316,6 +1321,7 @@ func (rf *Raft) getLogicalLastLogEntryIndexTerm() (int, int) {
 	if len(rf.log) == 1 {
 		return rf.lastIncludedIndex, rf.lastIncludedTerm
 	}
-	var idx = len(rf.log) - 1
-	return idx, rf.log[idx].Term
+	var idx = len(rf.log) - 1 // idx is physical index
+	var logicalIdx = rf.physicalToLogicalIndex(idx)
+	return logicalIdx, rf.log[idx].Term
 }
