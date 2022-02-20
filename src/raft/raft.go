@@ -1036,15 +1036,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Term = rf.currentTerm
 		reply.Success = true // success
 
-	} else if rf.EntryInBound(args.PrevLogIndex) && args.PrevLogIndex+len(args.Entries) >= len(rf.log) {
+	} else if phyPrevLogIndex := rf.logicalToPhysicalIndex(args.PrevLogIndex); rf.EntryInBound(phyPrevLogIndex) && phyPrevLogIndex+len(args.Entries) >= len(rf.log) {
 		// log      [1 2 3 4 5 6]
 		// entries          [5 6 7 8]
 		//                   c
-		var argsPrevLogIndex = args.PrevLogIndex
-		var curr = argsPrevLogIndex + 1
+		var curr = phyPrevLogIndex + 1
 
 		// Check inconsistency (discard the log if necessary)
 		var logConsistent = true
+
 		var i = 0
 		for i = 0; curr+i < len(rf.log); i++ {
 			var logIdx = curr + i
